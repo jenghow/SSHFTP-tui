@@ -22,8 +22,10 @@ what the Rust toolchain already ships.
 
 * **Real PTY.** `xterm-256color` is requested from the server; output is parsed
   by `vt100` and rendered cell by cell, so colours, attributes, wide glyphs and
-  cursor placement behave like a normal terminal. Terminal resizes propagate to
-  the remote shell (SIGWINCH) via a channel window-change request.
+  cursor placement behave like a normal terminal. The caret is drawn as a
+  blinking block by the app itself, so it looks the same in every emulator.
+  Terminal resizes propagate to the remote shell (SIGWINCH) via a channel
+  window-change request.
 * **SFTP strictly on demand.** Connecting opens an SSH session and a shell
   channel and *nothing else*. The SFTP subsystem channel is opened only when you
   press `F3`; until then the right pane shows
@@ -172,10 +174,9 @@ If it fails, the form shows one of these:
 If the remote shell exits (`exit`, `Ctrl+D`, a `logout`) or the connection drops,
 the app returns to the connect form instead of leaving a dead terminal on screen.
 The reason is shown on the form — `Remote shell exited with status 0 — sign in
-again` — and it starts blank apart from the environment username, the default
-port and the key file path, so you type the details for the new session; nothing
-from the old one, the password included, is carried over. Press `F10` instead if
-you want to quit.
+again` — and it starts blank apart from the default port and the key file path,
+so you type the details for the new session; nothing from the old one, the
+password included, is carried over. Press `F10` instead if you want to quit.
 
 Everything the finished session owned is discarded: the terminal grid and its
 scrollback, the SFTP subsystem (press `F3` to open a new one), the remote listing
@@ -226,6 +227,7 @@ SFTP tab:
 | `F6`          | Rename                                       |
 | `F7`          | Create a directory                           |
 | `F8`          | Delete (directories are removed recursively) |
+| `F9`          | Change directory (type a path; `Ctrl+U` clears) |
 
 Logs tab: `Up`/`Down`/`PgUp`/`PgDn` scroll, `End` resumes following.
 

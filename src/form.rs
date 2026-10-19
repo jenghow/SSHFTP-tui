@@ -123,13 +123,12 @@ pub struct ConnectForm {
 
 impl Default for ConnectForm {
     fn default() -> Self {
-        let username = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_default();
+        // Nothing about the local account is prefilled: the operator decides
+        // which remote user to log in as. Only the transport defaults stay.
         Self {
             host: TextField::default(),
             port: TextField::new("22"),
-            username: TextField::new(username),
+            username: TextField::default(),
             auth: AuthKind::Password,
             password: TextField::default(),
             key_path: TextField::new("~/.ssh/id_ed25519"),
@@ -322,6 +321,17 @@ mod tests {
         field.home();
         field.delete();
         assert_eq!(field.value, "héll");
+    }
+
+    #[test]
+    fn the_default_form_does_not_guess_the_username() {
+        let form = ConnectForm::default();
+        assert!(
+            form.username.value.is_empty(),
+            "the local account must not leak into the login form"
+        );
+        assert_eq!(form.port.value, "22");
+        assert_eq!(form.key_path.value, "~/.ssh/id_ed25519");
     }
 
     #[test]

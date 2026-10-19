@@ -12,8 +12,8 @@ use ratatui::widgets::TableState;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::event::{
-    Cmd, Endpoint, Evt, FsEntry, LogLevel, PaneKind, local_join, local_parent, remote_join,
-    remote_parent,
+    Cmd, Endpoint, Evt, FsEntry, LogLevel, PaneKind, local_join, local_normalize, local_parent,
+    remote_join, remote_normalize, remote_parent,
 };
 use crate::form::{ConnectForm, Field, TextField};
 use crate::keys;
@@ -202,8 +202,20 @@ pub struct InputModal {
 }
 
 pub enum InputAction {
-    Rename { pane: PaneKind, from: String },
-    Mkdir { pane: PaneKind, parent: String },
+    Rename {
+        pane: PaneKind,
+        from: String,
+    },
+    Mkdir {
+        pane: PaneKind,
+        parent: String,
+    },
+    /// `base` is the pane's cwd when the dialog opened; a relative path is
+    /// resolved against it. Absolute paths replace it.
+    ChangeDir {
+        pane: PaneKind,
+        base: String,
+    },
 }
 
 pub struct ConfirmModal {
@@ -277,6 +289,10 @@ pub struct App {
     pub connected: bool,
     pub host_label: String,
     pub next_transfer_id: u64,
+    /// Phase of the locally drawn SSH cursor: `true` is the "on" half of the
+    /// blink. The UI loop flips it every 500 ms; keys and PTY output turn it
+    /// back on so typing never waits for the next phase.
+    pub blink_on: bool,
     tx: mpsc::Sender<Cmd>,
 }
 
@@ -309,6 +325,7 @@ impl App {
             connected: false,
             host_label: "sshftp-tui".to_string(),
             next_transfer_id: 1,
+            blink_on: true,
             tx,
         };
         app.log(
@@ -324,6 +341,11 @@ impl App {
 
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    /// One half-period of the SSH cursor blink, driven by the UI loop.
+    pub fn blink_tick(&mut self) {
+        self.blink_on = !self.blink_on;
     }
 
     async fn send(&self, cmd: Cmd) {
@@ -360,6 +382,8 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        // Keep the caret solid while the user is typing.
+        self.blink_on = true;
         if self.modal.is_some() {
             self.on_modal_key(key).await;
             return;
@@ -439,7 +463,8 @@ impl App {
         self.screen = Screen::Connect;
         self.connected = false;
         // The chosen policy is a blank form. `ConnectForm::default()` restores
-        // exactly the environment username, the default port and the key path.
+        // only the transport defaults (port and key path), never the local
+        // account's username.
         self.form = ConnectForm::default();
         // `draw_connect` has no status line, so the reason goes where the form
         // already reports problems: on the line below the fields.
@@ -520,6 +545,7 @@ impl App {
             KeyCode::F(6) => self.open_rename_modal(),
             KeyCode::F(7) => self.open_mkdir_modal(),
             KeyCode::F(8) => self.open_delete_modal(),
+            KeyCode::F(9) => self.open_chdir_modal(),
             _ => {}
         }
     }
@@ -698,6 +724,31 @@ impl App {
         }));
     }
 
+    /// Resolve a typed directory against the pane's cwd. Absolute input wins;
+    /// otherwise the two are joined and folded, so `..` and `sub/./x` work.
+    fn resolve_dir(pane: PaneKind, base: &str, value: &str) -> String {
+        match pane {
+            PaneKind::Local => local_normalize(&local_join(base, value)),
+            PaneKind::Remote => remote_normalize(&remote_join(base, value)),
+        }
+    }
+
+    fn open_chdir_modal(&mut self) {
+        if self.focus == Focus::Remote && !self.sftp.is_ready() {
+            self.set_status("Press [F3] to initialize the SFTP session first");
+            return;
+        }
+        let pane = self.focus.kind();
+        let base = self.pane(self.focus).cwd.clone();
+        self.modal = Some(Modal::Input(InputModal {
+            title: "Change directory".to_string(),
+            label: format!("Directory for {} (relative to {base}):", pane.label()),
+            field: TextField::new(base.clone()),
+            error: None,
+            action: InputAction::ChangeDir { pane, base },
+        }));
+    }
+
     fn open_delete_modal(&mut self) {
         let Some(entry) = self.pane(self.focus).selected().cloned() else {
             self.set_status("Nothing selected");
@@ -752,13 +803,26 @@ impl App {
                     // the dialog would vanish on the first keystroke.
                     KeyCode::Esc => return,
                     KeyCode::Enter => {
-                        let name = modal.field.value.trim().to_string();
-                        if name.is_empty() {
-                            modal.error = Some("Name cannot be empty".to_string());
-                        } else if name.contains('/')
-                            || name.contains('\\')
-                            || name == "."
-                            || name == ".."
+                        let value = modal.field.value.trim().to_string();
+                        let is_chdir = matches!(modal.action, InputAction::ChangeDir { .. });
+                        if value.is_empty() {
+                            modal.error = Some(if is_chdir {
+                                "Path cannot be empty".to_string()
+                            } else {
+                                "Name cannot be empty".to_string()
+                            });
+                        } else if let InputAction::ChangeDir { pane, base } = &modal.action {
+                            let target = Self::resolve_dir(*pane, base, &value);
+                            let cmd = match pane {
+                                PaneKind::Local => Cmd::LocalList { path: target },
+                                PaneKind::Remote => Cmd::SftpList { path: target },
+                            };
+                            self.send(cmd).await;
+                            return;
+                        } else if value.contains('/')
+                            || value.contains('\\')
+                            || value == "."
+                            || value == ".."
                         {
                             modal.error = Some(
                                 "Name cannot contain path separators or be . or ..".to_string(),
@@ -769,16 +833,26 @@ impl App {
                                     self.send(Cmd::Rename {
                                         pane,
                                         from,
-                                        to: name,
+                                        to: value,
                                     })
                                     .await;
                                 }
                                 InputAction::Mkdir { pane, parent } => {
-                                    self.send(Cmd::Mkdir { pane, parent, name }).await;
+                                    self.send(Cmd::Mkdir {
+                                        pane,
+                                        parent,
+                                        name: value,
+                                    })
+                                    .await;
                                 }
+                                InputAction::ChangeDir { .. } => unreachable!(),
                             }
                             return;
                         }
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        modal.field = TextField::default();
+                        modal.error = None;
                     }
                     KeyCode::Backspace => modal.field.backspace(),
                     KeyCode::Delete => modal.field.delete(),
@@ -871,6 +945,7 @@ impl App {
                 self.set_status("Host key changed — connection refused");
             }
             Evt::PtyData(bytes) => {
+                self.blink_on = true;
                 self.parser.process(&bytes);
             }
             Evt::PtyClosed(code) => {
@@ -979,6 +1054,10 @@ mod tests {
 
     fn press_shift(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn press_ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     fn type_text(app: &mut App, text: &str) {
@@ -1144,6 +1223,214 @@ mod tests {
         }
     }
 
+    /// An app sitting on the SFTP tab with a live subsystem and a remote cwd.
+    fn sftp_app(focus: Focus) -> (App, mpsc::Receiver<Cmd>) {
+        let (mut app, rx) = app();
+        app.screen = Screen::Main;
+        app.connected = true;
+        app.tab = Tab::Sftp;
+        app.focus = focus;
+        app.sftp = SftpState::Ready;
+        app.remote = Pane::new("/home/tester");
+        (app, rx)
+    }
+
+    fn chdir_action(app: &App) -> (PaneKind, String) {
+        match app.modal.as_ref().expect("a modal is open") {
+            Modal::Input(modal) => match &modal.action {
+                InputAction::ChangeDir { pane, base } => (*pane, base.clone()),
+                _ => panic!("expected the chdir action"),
+            },
+            _ => panic!("expected the input modal"),
+        }
+    }
+
+    #[test]
+    fn f9_opens_a_prefilled_chdir_dialog() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+
+        assert_eq!(input_field(&app).value, "/home/tester");
+        assert_eq!(input_field(&app).cursor, 12, "the caret ends up at the end");
+        assert_eq!(
+            chdir_action(&app),
+            (PaneKind::Remote, "/home/tester".into())
+        );
+        assert!(rx.try_recv().is_err(), "opening a dialog sends nothing");
+    }
+
+    #[test]
+    fn chdir_remote_absolute_path_is_sent_as_typed() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press_ctrl('u')));
+        type_text(&mut app, "/var/log");
+        futures::executor::block_on(app.on_modal_key(press(KeyCode::Enter)));
+
+        assert!(app.modal.is_none());
+        match rx.try_recv() {
+            Ok(Cmd::SftpList { path }) => assert_eq!(path, "/var/log"),
+            Ok(_) => panic!("expected Cmd::SftpList"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+    }
+
+    #[test]
+    fn chdir_remote_relative_path_resolves_against_the_pane_cwd() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press_ctrl('u')));
+        type_text(&mut app, "logs");
+        futures::executor::block_on(app.on_modal_key(press(KeyCode::Enter)));
+
+        match rx.try_recv() {
+            Ok(Cmd::SftpList { path }) => assert_eq!(path, "/home/tester/logs"),
+            Ok(_) => panic!("expected Cmd::SftpList"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+    }
+
+    #[test]
+    fn chdir_folds_dot_and_dotdot_segments() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press_ctrl('u')));
+        type_text(&mut app, "../shared/./docs");
+        futures::executor::block_on(app.on_modal_key(press(KeyCode::Enter)));
+
+        match rx.try_recv() {
+            Ok(Cmd::SftpList { path }) => assert_eq!(path, "/home/shared/docs"),
+            Ok(_) => panic!("expected Cmd::SftpList"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+    }
+
+    #[test]
+    fn chdir_relative_path_never_escapes_the_remote_root() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press_ctrl('u')));
+        type_text(&mut app, "../../../../etc");
+        futures::executor::block_on(app.on_modal_key(press(KeyCode::Enter)));
+
+        match rx.try_recv() {
+            Ok(Cmd::SftpList { path }) => assert_eq!(path, "/etc"),
+            Ok(_) => panic!("expected Cmd::SftpList"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+    }
+
+    #[test]
+    fn chdir_on_the_local_pane_lists_locally() {
+        let (mut app, mut rx) = sftp_app(Focus::Local);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press_ctrl('u')));
+        type_text(&mut app, "sub");
+        futures::executor::block_on(app.on_modal_key(press(KeyCode::Enter)));
+
+        match rx.try_recv() {
+            Ok(Cmd::LocalList { path }) => {
+                assert!(path.ends_with("sub"), "{path}");
+                assert!(!path.starts_with('/') || cfg!(unix), "{path}");
+            }
+            Ok(_) => panic!("expected Cmd::LocalList"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+    }
+
+    #[test]
+    fn chdir_is_refused_until_sftp_is_ready() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        app.sftp = SftpState::NotInitialized;
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+
+        assert!(app.modal.is_none(), "no dialog without a subsystem");
+        assert!(app.status.contains("[F3]"), "{}", app.status);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn empty_chdir_stays_open_with_an_error() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        futures::executor::block_on(app.on_modal_key(press_ctrl('u')));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press(KeyCode::Enter)));
+
+        match app.modal.as_ref() {
+            Some(Modal::Input(modal)) => assert!(modal.error.is_some()),
+            _ => panic!("the dialog must stay open"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing is sent");
+    }
+
+    #[test]
+    fn escape_closes_the_chdir_dialog_without_sending() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press(KeyCode::Esc)));
+
+        assert!(app.modal.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_dialog_field() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_modal_key(press_ctrl('u')));
+
+        assert!(input_field(&app).value.is_empty());
+        assert_eq!(input_field(&app).cursor, 0);
+        assert!(matches!(app.modal, Some(Modal::Input(_))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn blink_tick_toggles_the_ssh_caret() {
+        let (mut app, _rx) = app();
+        assert!(app.blink_on, "the caret starts solid");
+        app.blink_tick();
+        assert!(!app.blink_on);
+        app.blink_tick();
+        assert!(app.blink_on);
+    }
+
+    #[test]
+    fn typing_and_output_reset_the_blink_phase() {
+        let (mut app, mut rx) = app();
+        app.screen = Screen::Main;
+        app.tab = Tab::Terminal;
+        drain(&mut rx);
+
+        app.blink_on = false;
+        futures::executor::block_on(app.on_key(press(KeyCode::Char('a'))));
+        assert!(app.blink_on, "a keystroke makes the caret solid again");
+
+        app.blink_on = false;
+        futures::executor::block_on(app.on_event(Evt::PtyData(b"x".to_vec())));
+        assert!(app.blink_on, "new output makes the caret solid again");
+    }
+
     #[test]
     fn shift_navigation_scrolls_the_terminal_history_locally() {
         let (mut app, mut rx) = app();
@@ -1267,9 +1554,9 @@ mod tests {
         assert_eq!(app.screen, Screen::Connect, "the login dialog comes back");
         assert!(!app.connected);
         assert!(!app.form.connecting);
-        // Blank form: only the environment username, the default port and the
-        // key path are left.
+        // Blank form: only the default port and the key path are left.
         assert!(app.form.host.value.is_empty());
+        assert!(app.form.username.value.is_empty());
         assert!(app.form.password.value.is_empty());
         assert_eq!(app.form.port.value, "22");
         assert_eq!(app.form.focus, Field::Host);

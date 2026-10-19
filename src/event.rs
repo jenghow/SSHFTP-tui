@@ -255,6 +255,63 @@ pub fn local_join(cwd: &str, name: &str) -> String {
     Path::new(cwd).join(name).to_string_lossy().into_owned()
 }
 
+/// Fold `.` and `..` lexically so a typed path reads back the way a shell
+/// would print it. This is a *string* operation on purpose: the UI task must
+/// not touch the filesystem, and the server resolves the real path anyway.
+pub fn remote_normalize(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// The local counterpart of [`remote_normalize`], keeping the platform prefix
+/// and root (`C:\` stays `C:\`).
+pub fn local_normalize(path: &str) -> String {
+    use std::path::Component;
+
+    let mut prefix: Option<std::ffi::OsString> = None;
+    let mut rooted = false;
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+
+    for component in Path::new(path).components() {
+        match component {
+            Component::Prefix(p) => prefix = Some(p.as_os_str().to_os_string()),
+            Component::RootDir => rooted = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(name) => parts.push(name.to_os_string()),
+        }
+    }
+
+    let mut result = PathBuf::new();
+    if let Some(prefix) = prefix {
+        result.push(prefix);
+    }
+    if rooted {
+        result.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+    }
+    for part in parts {
+        result.push(part);
+    }
+    result.to_string_lossy().into_owned()
+}
+
 pub fn local_parent(path: &str) -> Option<String> {
     Path::new(path)
         .parent()
@@ -288,6 +345,33 @@ mod tests {
         assert_eq!(remote_file_name("/var/www/index.html"), "index.html");
         assert_eq!(remote_file_name("/var/www/"), "www");
         assert_eq!(remote_file_name("file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn remote_normalize_folds_dot_segments() {
+        assert_eq!(
+            remote_normalize("/home/tester/../shared/./docs"),
+            "/home/shared/docs"
+        );
+        assert_eq!(remote_normalize("/../../etc"), "/etc");
+        assert_eq!(remote_normalize("/"), "/");
+        assert_eq!(remote_normalize("/var/"), "/var");
+        assert_eq!(remote_normalize("relative/x"), "relative/x");
+    }
+
+    #[test]
+    fn local_normalize_keeps_the_windows_prefix_and_root() {
+        #[cfg(windows)]
+        {
+            assert_eq!(local_normalize(r"C:\Users\me\..\other"), r"C:\Users\other");
+            assert_eq!(local_normalize(r"C:\Users\me\..\..\other"), r"C:\other");
+            assert_eq!(local_normalize(r"C:\"), r"C:\");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(local_normalize("/home/me/../other"), "/other");
+            assert_eq!(local_normalize("/"), "/");
+        }
     }
 
     #[test]

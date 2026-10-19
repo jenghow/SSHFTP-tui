@@ -83,6 +83,16 @@ async fn ui_loop(
     events: &mut EventStream,
     mut rx_evt: mpsc::Receiver<Evt>,
 ) -> Result<()> {
+    // Drives the SSH caret blink: two redraws per second are enough, and
+    // `tick` is cancel-safe so it can sit in the same `select!`. The first
+    // phase starts at zero, so `App::blink_on`'s initial "solid" is really the
+    // state the app opens with.
+    let mut blink = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
+    blink.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
@@ -94,6 +104,7 @@ async fn ui_loop(
                 Some(Err(_)) | None => break,
             },
             Some(event) = rx_evt.recv() => app.on_event(event).await,
+            _ = blink.tick() => app.blink_tick(),
         }
 
         if app.should_quit {
@@ -110,13 +121,15 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn init() -> Result<Self> {
         enable_raw_mode()?;
-        // A steady block is what the form fields are designed around: it sits
-        // on the character at the insertion point, or on the blank cell right
-        // after the last one, so it always reads as "typing happens here".
+        // A block is what the form fields are designed around: it sits on the
+        // character at the insertion point, or on the blank cell right after
+        // the last one, so it always reads as "typing happens here". The SSH
+        // tab draws its own blinking block (see `ui::draw_terminal`) because
+        // not every terminal honours this request.
         execute!(
             io::stdout(),
             EnterAlternateScreen,
-            SetCursorStyle::SteadyBlock
+            SetCursorStyle::BlinkingBlock
         )?;
         Ok(Self)
     }

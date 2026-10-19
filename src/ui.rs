@@ -82,6 +82,16 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
     let (rows, cols) = screen.size();
     let mut lines: Vec<Line> = Vec::with_capacity(rows as usize);
 
+    // The caret is drawn as a reversed cell instead of asking the terminal for
+    // a cursor: not every emulator honours `SetCursorStyle`, and a drawn block
+    // can blink on our own schedule. `blink_on` is the "on" phase toggled by
+    // `App::blink_tick`.
+    let cursor = if screen.hide_cursor() || scrolled > 0 || !app.blink_on {
+        None
+    } else {
+        Some(screen.cursor_position())
+    };
+
     for row in 0..rows {
         let mut spans: Vec<Span> = Vec::new();
         let mut text = String::new();
@@ -94,7 +104,13 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
             if cell.is_wide_continuation() {
                 continue;
             }
-            let cell_style = cell_style(cell);
+            let mut cell_style = cell_style(cell);
+            if cursor == Some((row, col)) {
+                // `REVERSED` swaps the *resolved* colors, so a blank cell in
+                // default colors still shows a block (a fg/bg swap of two
+                // `Reset` values would not).
+                cell_style = cell_style.add_modifier(Modifier::REVERSED);
+            }
             if cell_style != style && !text.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut text), style));
             }
@@ -111,21 +127,7 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(spans));
     }
 
-    // `cursor_position` is the live grid's, so showing it while the view is
-    // scrolled back would park the caret over unrelated history.
-    let cursor = if screen.hide_cursor() || scrolled > 0 {
-        None
-    } else {
-        Some(screen.cursor_position())
-    };
-
     frame.render_widget(Paragraph::new(lines).block(block), area);
-
-    if let Some((row, col)) = cursor {
-        if row < inner.height && col < inner.width {
-            frame.set_cursor_position(Position::new(inner.x + col, inner.y + row));
-        }
-    }
 }
 
 fn cell_style(cell: &vt100::Cell) -> Style {
@@ -319,7 +321,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
         Tab::Terminal => "[Ctrl+T] Tab Change   [F10] Exit".to_string(),
         Tab::Sftp => format!(
-            "Focus: {}   F3 Init   Tab Pane   Enter Open   F4 Refresh   F5 Copy   F6 Rename   F7 Mkdir   F8 Delete",
+            "Focus: {}  F3 Init  Tab Pane  Enter Open  F4 Refresh  F5 Copy  F6 Rename  F7 Mkdir  F8 Delete  F9 Chdir",
             app.focus.label()
         ),
         Tab::Logs => {
@@ -335,6 +337,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::new().fg(Color::LightGreen)
+    };
+
+    // A narrow terminal cannot fit both. The hints are static help, the status
+    // reports what just happened, so the status wins outright: the hints are
+    // dropped rather than chopped into an unreadable prefix.
+    let hints = if hints.chars().count() + status.chars().count() + 3 > area.width as usize {
+        String::new()
+    } else {
+        hints
     };
 
     let padding =
@@ -649,6 +660,39 @@ mod tests {
         (text, cursor)
     }
 
+    /// Renders the terminal tab and returns the finished backend together with
+    /// the screen coordinates of the cell the SSH caret should occupy: the PTY
+    /// grid sits one column in (border) and four rows down (three tab rows plus
+    /// the border).
+    fn render_ssh_cursor(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> (Terminal<TestBackend>, u16, u16) {
+        app.screen = Screen::Main;
+        app.tab = Tab::Terminal;
+        app.on_resize(width, height);
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("rendering never fails on a test backend");
+
+        let (row, col) = app.parser.screen().cursor_position();
+        (terminal, col + 1, row + 4)
+    }
+
+    fn caret_is_block(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> bool {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .expect("the caret cell exists")
+            .modifier
+            .contains(Modifier::REVERSED)
+    }
+
     /// Row and first *column* of `needle` in rendered screen text. Columns count
     /// characters, matching the coordinates the frame reports to the terminal.
     fn locate(text: &str, needle: &str) -> (u16, u16) {
@@ -774,25 +818,62 @@ mod tests {
         assert!(!live.contains("oldest marker"), "{live}");
         assert!(!live.contains("SCROLLBACK"), "{live}");
 
+        // The live view draws the block caret and never asks for the hardware
+        // cursor, which would otherwise blink in the terminal's own style.
+        let (terminal, x, y) = render_ssh_cursor(&mut app, 100, 30);
+        assert!(
+            caret_is_block(&terminal, x, y),
+            "the live view shows a block"
+        );
+        assert!(!terminal.backend().cursor_visible());
+
         app.parser.screen_mut().set_scrollback(usize::MAX);
-        let (text, cursor) = render_with_cursor(&mut app, 100, 30);
+        let text = render(&mut app, 100, 30);
         assert!(text.contains("oldest marker"), "{text}");
         assert!(text.contains("SCROLLBACK +"), "{text}");
         assert!(text.contains("Shift+End returns"), "{text}");
-        assert_eq!(
-            cursor,
-            Position::ORIGIN,
-            "no caret while scrolled back:\n{text}"
+
+        let (terminal, x, y) = render_ssh_cursor(&mut app, 100, 30);
+        assert!(
+            !caret_is_block(&terminal, x, y),
+            "no caret while scrolled back"
         );
 
         app.parser.screen_mut().set_scrollback(0);
-        let (text, cursor) = render_with_cursor(&mut app, 100, 30);
-        assert!(!text.contains("SCROLLBACK"), "{text}");
-        assert_ne!(
-            cursor,
-            Position::ORIGIN,
-            "the caret returns with the live view"
+        let (terminal, x, y) = render_ssh_cursor(&mut app, 100, 30);
+        assert!(
+            caret_is_block(&terminal, x, y),
+            "the block returns with the live view"
         );
+    }
+
+    #[test]
+    fn the_block_caret_blinks_on_the_app_phase() {
+        let (mut app, _rx) = app();
+        app.parser.process(b"$ ");
+
+        app.blink_on = true;
+        let (terminal, x, y) = render_ssh_cursor(&mut app, 100, 30);
+        assert!(caret_is_block(&terminal, x, y));
+
+        app.blink_on = false;
+        let (terminal, x, y) = render_ssh_cursor(&mut app, 100, 30);
+        assert!(
+            !caret_is_block(&terminal, x, y),
+            "the off half shows no block"
+        );
+    }
+
+    #[test]
+    fn a_remote_hidden_cursor_draws_no_block() {
+        let (mut app, _rx) = app();
+        app.parser.process(b"$ \x1b[?25l");
+        app.blink_on = true;
+
+        let (terminal, x, y) = render_ssh_cursor(&mut app, 100, 30);
+
+        assert!(!caret_is_block(&terminal, x, y));
+        assert!(!terminal.backend().cursor_visible());
     }
 
     #[test]
@@ -856,10 +937,35 @@ mod tests {
         app.tab = Tab::Sftp;
         let text = render(&mut app, 120, 30);
         assert!(text.contains("F5 Copy"), "{text}");
+        assert!(text.contains("F9 Chdir"), "{text}");
         assert!(text.contains("Focus: Left"), "{text}");
 
         app.focus = Focus::Remote;
         let text = render(&mut app, 120, 30);
         assert!(text.contains("Focus: Right"), "{text}");
+    }
+
+    #[test]
+    fn a_long_status_never_pushes_the_sftp_hints_off_screen() {
+        let (mut app, _rx) = app();
+        app.screen = Screen::Main;
+        app.tab = Tab::Sftp;
+        app.set_status(
+            "reading remote directory /home/tester/some/deeply/nested/path: no such file",
+        );
+
+        let text = render(&mut app, 120, 30);
+        let footer = text.lines().last().unwrap_or_default();
+        assert!(footer.contains("no such file"), "{text}");
+        assert!(
+            !footer.contains("F9 Chdir"),
+            "the hints give way to the status: {text}"
+        );
+
+        // With room for both, the hints come back.
+        app.set_status("ready");
+        let text = render(&mut app, 120, 30);
+        let footer = text.lines().last().unwrap_or_default();
+        assert!(footer.contains("F9 Chdir"), "{text}");
     }
 }

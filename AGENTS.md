@@ -86,14 +86,30 @@ the e2e test uses it once, before any thread reads the variable.
 * Keys: `Ctrl+T` is intercepted globally; `Ctrl+C` and everything else go to the
   remote shell. Only `F10` (and `Esc` on the connect form) quit. `Shift+PgUp`/
   `PgDn`/`Home`/`End` are the other local exception — see the scrollback bullet.
+  On the SFTP tab `F3`–`F9` are local: `F9` opens the chdir dialog, which is the
+  only way to jump to a path that is not a child of the current listing. It
+  resolves the typed value with `local_join`/`remote_join` and then
+  `local_normalize`/`remote_normalize` (pure string folding, so `..` and
+  `sub/./x` work and the remote path never grows a backslash), and sends the
+  usual `Cmd::LocalList`/`Cmd::SftpList` — no new command, no filesystem probe
+  on the UI task. `Ctrl+U` clears a dialog field.
 * **Terminal scrollback lives in the parser, not in `App`.** `vt100::Parser` is
   built with 2000 lines of history and the view offset is driven by
   `parser.screen_mut().set_scrollback(n)`, which clamps to what exists (use
   `usize::MAX` for "oldest", never `scrollback_len()` — that is the *capacity*).
-  `ui::draw_terminal` renders whatever offset is active, so it must only hide
+  `ui::draw_terminal` renders whatever offset is active, so it must only drop
   the caret and relabel the title; plain `PgUp`/`PgDn` stay forwarded to the
   remote. The alternate grid has no scrollback, and `submit_connect` clears the
   history so sessions don't share it.
+* **The SSH caret is drawn, not requested.** `draw_terminal` adds
+  `Modifier::REVERSED` to the cell under `screen.cursor_position()` and never
+  calls `frame.set_cursor_position`, so the hardware cursor is hidden on that
+  tab. `App::blink_on` is the visible half of the blink: `main::ui_loop` flips it
+  from a 500 ms interval and keystrokes and `Evt::PtyData` set it back to `true`.
+  Use the modifier, not a fg/bg swap — two `Reset` colors would render nothing.
+  The block is skipped when the remote hid the cursor or the view is scrolled
+  back. The connect form and dialogs still use the hardware cursor, which
+  `TerminalGuard` asks to be a blinking block.
 
 ## Host keys
 
