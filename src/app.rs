@@ -15,8 +15,9 @@ use crate::event::{
     Cmd, Endpoint, Evt, FsEntry, LogLevel, PaneKind, local_join, local_normalize, local_parent,
     remote_join, remote_normalize, remote_parent,
 };
-use crate::form::{ConnectForm, Field, TextField};
+use crate::form::{ConfigFill, ConnectForm, DEFAULT_KEY_PATH, Field, TextField};
 use crate::keys;
+use crate::sshconfig::SshConfig;
 
 /// Terminal history the parser is built with. It is a *capacity*: how much of
 /// it is filled is asked of the screen, never assumed (see `AGENTS.md`).
@@ -293,6 +294,8 @@ pub struct App {
     /// blink. The UI loop flips it every 500 ms; keys and PTY output turn it
     /// back on so typing never waits for the next phase.
     pub blink_on: bool,
+    /// Parsed once at startup (`main::run`); lookups are pure.
+    ssh_config: SshConfig,
     tx: mpsc::Sender<Cmd>,
 }
 
@@ -326,6 +329,7 @@ impl App {
             host_label: "sshftp-tui".to_string(),
             next_transfer_id: 1,
             blink_on: true,
+            ssh_config: SshConfig::default(),
             tx,
         };
         app.log(
@@ -412,9 +416,18 @@ impl App {
         match key.code {
             KeyCode::Esc => self.should_quit = true,
             KeyCode::Enter if !self.form.connecting => self.submit_connect().await,
-            KeyCode::Tab => self.form.focus_next(false),
-            KeyCode::BackTab | KeyCode::Up => self.form.focus_next(true),
-            KeyCode::Down => self.form.focus_next(false),
+            KeyCode::Tab => {
+                self.leave_host_field();
+                self.form.focus_next(false);
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.leave_host_field();
+                self.form.focus_next(true);
+            }
+            KeyCode::Down => {
+                self.leave_host_field();
+                self.form.focus_next(false);
+            }
             KeyCode::Left if self.form.focus == Field::Auth && !self.form.connecting => {
                 self.form.toggle_auth();
             }
@@ -477,7 +490,97 @@ impl App {
         self.host_label = "sshftp-tui".to_string();
     }
 
+    /// Hands the parsed `~/.ssh/config` to the app: `main::run` calls this once,
+    /// before the first frame, and the tests call it with a parsed fixture.
+    pub fn set_ssh_config(&mut self, config: SshConfig) {
+        self.ssh_config = config;
+        // A target on the command line may already name an alias.
+        if let Err(error) = self.apply_ssh_config() {
+            self.form.error = Some(error);
+        }
+    }
+
+    /// Fills the form from the parsed config. Only fields still holding their
+    /// defaults are replaced, and the Host field becomes the resolved
+    /// `HostName`, so what the form shows is exactly what will be dialled.
+    ///
+    /// `ProxyJump`/`ProxyCommand` are refused rather than ignored: this client
+    /// cannot reach a host through a bastion, and pretending otherwise would
+    /// hide that the connection is a different one.
+    fn apply_ssh_config(&mut self) -> Result<(), String> {
+        let typed = self.form.host.trimmed().to_string();
+        if typed.is_empty() {
+            return Ok(());
+        }
+
+        let Some(resolved) = self.ssh_config.lookup(&typed) else {
+            // Keep the note when the Host field already holds the hostname we
+            // resolved; clear it when the operator typed something else.
+            if !self
+                .form
+                .config
+                .as_ref()
+                .is_some_and(|fill| fill.hostname == typed)
+            {
+                self.form.config = None;
+            }
+            return Ok(());
+        };
+
+        if let Some(proxy) = &resolved.proxy {
+            self.form.config = None;
+            return Err(format!(
+                "{proxy} is set for {typed} in ~/.ssh/config; jump hosts are not supported, connect directly or use ssh"
+            ));
+        }
+
+        if resolved.hostname != typed {
+            self.form.host = TextField::new(&resolved.hostname);
+        }
+        if self.form.username.trimmed().is_empty() {
+            if let Some(user) = &resolved.user {
+                self.form.username = TextField::new(user);
+            }
+        }
+        if self.form.port.trimmed() == "22" {
+            if let Some(port) = resolved.port {
+                self.form.port = TextField::new(port.to_string());
+            }
+        }
+        if self.form.key_path.trimmed() == DEFAULT_KEY_PATH {
+            if let Some(key) = &resolved.identity_file {
+                self.form.key_path = TextField::new(key);
+            }
+        }
+
+        self.form.config = Some(ConfigFill {
+            source: self.ssh_config.label().to_string(),
+            endpoint: self.form.endpoint(),
+            alias: resolved.alias,
+            hostname: resolved.hostname,
+        });
+        Ok(())
+    }
+
+    /// Resolve the alias as soon as the operator leaves the Host field, so the
+    /// prefilled values are visible before Enter is pressed.
+    fn leave_host_field(&mut self) {
+        if self.form.focus != Field::Host {
+            return;
+        }
+        if let Err(error) = self.apply_ssh_config() {
+            self.form.error = Some(error);
+        }
+    }
+
     async fn submit_connect(&mut self) {
+        // A `Host` alias may be the only thing in the form; resolve it before
+        // validation so the config can supply the username and port.
+        if let Err(error) = self.apply_ssh_config() {
+            self.form.error = Some(error);
+            self.form.connecting = false;
+            return;
+        }
         match self.form.build_params(self.pty_cols, self.pty_rows) {
             Ok(params) => {
                 // A fresh session starts on a blank grid: neither the previous
@@ -1429,6 +1532,87 @@ mod tests {
         app.blink_on = false;
         futures::executor::block_on(app.on_event(Evt::PtyData(b"x".to_vec())));
         assert!(app.blink_on, "new output makes the caret solid again");
+    }
+
+    #[test]
+    fn an_ssh_config_alias_prefills_the_form_when_host_is_left() {
+        let (mut app, mut rx) = app();
+        drain(&mut rx);
+        app.set_ssh_config(SshConfig::parse(
+            "Host prod\n    HostName 10.0.0.5\n    User deploy\n    Port 2222\n    IdentityFile ~/.ssh/prod\n",
+        ));
+
+        app.form.host = TextField::new("prod");
+        app.form.focus = Field::Host;
+        futures::executor::block_on(app.on_key(press(KeyCode::Tab)));
+
+        assert_eq!(app.form.host.value, "10.0.0.5");
+        assert_eq!(app.form.username.value, "deploy");
+        assert_eq!(app.form.port.value, "2222");
+        assert_eq!(app.form.key_path.value, "~/.ssh/prod");
+        assert_eq!(app.form.focus, Field::Port, "Tab still moves on");
+
+        let fill = app.form.config.as_ref().expect("the source note is set");
+        assert_eq!(fill.alias, "prod");
+        assert_eq!(fill.hostname, "10.0.0.5");
+        assert_eq!(fill.endpoint, "deploy@10.0.0.5:2222");
+        assert!(rx.try_recv().is_err(), "a lookup sends no command");
+    }
+
+    #[test]
+    fn ssh_config_only_fills_values_left_at_their_defaults() {
+        let (mut app, mut rx) = app();
+        drain(&mut rx);
+        app.set_ssh_config(SshConfig::parse(
+            "Host prod\n    HostName 10.0.0.5\n    User deploy\n    Port 2222\n",
+        ));
+
+        app.form.host = TextField::new("prod");
+        app.form.username = TextField::new("someone");
+        app.form.port = TextField::new("2200");
+        app.form.password = TextField::new("secret");
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+
+        let params = match rx.try_recv().expect("the connection is sent") {
+            Cmd::Connect(params) => params,
+            _ => panic!("expected a connect command"),
+        };
+        assert_eq!(params.host, "10.0.0.5", "the alias is always resolved");
+        assert_eq!(params.username, "someone", "typed username wins");
+        assert_eq!(params.port, 2200, "typed port wins");
+    }
+
+    #[test]
+    fn a_proxy_alias_is_refused_instead_of_dialled_directly() {
+        let (mut app, mut rx) = app();
+        drain(&mut rx);
+        app.set_ssh_config(SshConfig::parse(
+            "Host bastion-only\n    ProxyJump bastion\n",
+        ));
+
+        app.form.host = TextField::new("bastion-only");
+        app.form.username = TextField::new("deploy");
+        app.form.password = TextField::new("secret");
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+
+        let error = app.form.error.as_deref().expect("the form refuses");
+        assert!(error.contains("ProxyJump bastion"), "{error}");
+        assert!(error.contains("not supported"), "{error}");
+        assert!(!app.form.connecting);
+        assert!(rx.try_recv().is_err(), "nothing was dialled");
+    }
+
+    #[test]
+    fn a_command_line_alias_is_resolved_before_the_first_frame() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::new(tx, Some("prod".to_string()));
+        app.set_ssh_config(SshConfig::parse(
+            "Host prod\n    HostName 10.0.0.5\n    User deploy\n",
+        ));
+
+        assert_eq!(app.form.host.value, "10.0.0.5");
+        assert_eq!(app.form.username.value, "deploy");
+        assert!(app.form.config.is_some());
     }
 
     #[test]

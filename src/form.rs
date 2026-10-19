@@ -10,6 +10,24 @@ pub enum AuthKind {
     KeyFile,
 }
 
+/// The key path the form opens with; `apply_ssh_config` treats this value as
+/// "not chosen yet" and may replace it with the block's `IdentityFile`.
+pub const DEFAULT_KEY_PATH: &str = "~/.ssh/id_ed25519";
+
+/// Where the connection values came from, shown on the connect screen when a
+/// `Host` block filled them in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFill {
+    /// The file that supplied the values (`~/.ssh/config`, or the override).
+    pub source: String,
+    pub alias: String,
+    /// The resolved `HostName`; kept so re-resolving an unchanged form does not
+    /// clear the note.
+    pub hostname: String,
+    /// `user@host:port`, for display only.
+    pub endpoint: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Host,
@@ -119,6 +137,8 @@ pub struct ConnectForm {
     pub focus: Field,
     pub error: Option<String>,
     pub connecting: bool,
+    /// Set when `~/.ssh/config` supplied the host/user/port/key.
+    pub config: Option<ConfigFill>,
 }
 
 impl Default for ConnectForm {
@@ -131,11 +151,12 @@ impl Default for ConnectForm {
             username: TextField::default(),
             auth: AuthKind::Password,
             password: TextField::default(),
-            key_path: TextField::new("~/.ssh/id_ed25519"),
+            key_path: TextField::new(DEFAULT_KEY_PATH),
             passphrase: TextField::default(),
             focus: Field::Host,
             error: None,
             connecting: false,
+            config: None,
         }
     }
 }
@@ -173,6 +194,19 @@ impl ConnectForm {
         }
         if let Some(port) = port {
             self.port = TextField::new(port);
+        }
+    }
+
+    /// `user@host:port`, for the "where these values came from" line on the
+    /// connect screen.
+    pub fn endpoint(&self) -> String {
+        let host = self.host.trimmed();
+        let user = self.username.trimmed();
+        let port = self.port.trimmed();
+        if user.is_empty() {
+            format!("{host}:{port}")
+        } else {
+            format!("{user}@{host}:{port}")
         }
     }
 

@@ -422,6 +422,12 @@ fn draw_connect(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    if let Some(config) = &app.form.config {
+        lines.push(Line::from(Span::styled(
+            format!(" {}: {} → {}", config.source, config.alias, config.endpoint),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     lines.push(Line::from(""));
     if let Some(error) = &app.form.error {
         lines.push(Line::from(Span::styled(
@@ -589,7 +595,7 @@ mod tests {
     use super::*;
     use crate::app::{App, HostKeyModal, InputAction, InputModal, SftpState};
     use crate::event::{Cmd, FsEntry, LogLevel};
-    use crate::form::TextField;
+    use crate::form::{ConfigFill, TextField};
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend};
     use tokio::sync::mpsc;
@@ -714,6 +720,27 @@ mod tests {
         for label in ["Host", "Port", "Username", "Auth", "Password"] {
             assert!(text.contains(label), "missing {label}:\n{text}");
         }
+    }
+
+    #[test]
+    fn connect_screen_says_where_the_values_came_from() {
+        let (mut app, _rx) = app();
+        app.form.host = TextField::new("10.0.0.5");
+        app.form.username = TextField::new("deploy");
+        app.form.port = TextField::new("2222");
+        app.form.config = Some(ConfigFill {
+            source: "~/.ssh/config".to_string(),
+            alias: "prod".to_string(),
+            hostname: "10.0.0.5".to_string(),
+            endpoint: "deploy@10.0.0.5:2222".to_string(),
+        });
+
+        let text = render(&mut app, 100, 30);
+
+        assert!(
+            text.contains("~/.ssh/config: prod → deploy@10.0.0.5:2222"),
+            "{text}"
+        );
     }
 
     #[test]

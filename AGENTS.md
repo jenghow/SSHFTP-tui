@@ -61,6 +61,15 @@ the e2e test uses it once, before any thread reads the variable.
   network/disk I/O on the UI task, never draw from the network task.
   Integration tests drive `network::run` directly over channels.
 * `app.rs` holds all state and key routing; `ui.rs` is pure rendering.
+* **`~/.ssh/config` is parsed once, before the UI loop.** `sshconfig.rs` builds
+  an in-memory `SshConfig`; `main::run` loads it and passes it to
+  `App::set_ssh_config`, so the UI task never reads the file (and a network
+  `$HOME` cannot stall a frame). `App::apply_ssh_config` fills only fields still
+  at their defaults (empty username, port `22`, `DEFAULT_KEY_PATH`), always
+  replaces `Host` with the resolved `HostName` — so the form shows what will be
+  dialled and `known_hosts` uses the hostname — and refuses
+  `ProxyJump`/`ProxyCommand` with an error instead of dialling directly. The
+  note under the fields names the file that was actually read.
 * **Remote paths are POSIX strings** — `event::{remote_join, remote_parent,
   remote_file_name}`. `PathBuf` is for local paths only, so a Windows client
   can never send `C:\…` to a server.
@@ -130,7 +139,9 @@ the e2e test uses it once, before any thread reads the variable.
 ## Tests
 
 * Unit tests cover key encoding, POSIX path helpers, size formatting,
-  form/`TextField` (including bracketed IPv6), host-key policy using two
+  form/`TextField` (including bracketed IPv6), `sshconfig` parsing (patterns and
+  negation, first-value-wins, `Include`, tokens, proxy detection; fixtures are
+  `SshConfig::parse`/`load_at`, never the real file), host-key policy using two
   embedded ed25519 keys, RSA private-key loading (an EC2-style PKCS#1 PEM in
   `network::tests`, which is the guard that `russh`'s `rsa` feature is still
   enabled — it fails with `UnsupportedKeyType` if it is dropped), and the render
@@ -145,6 +156,9 @@ the e2e test uses it once, before any thread reads the variable.
   queues a `Cmd::Resize`. The same module covers the session lifecycle:
   `Evt::PtyClosed` must land on a blank login form, `Evt::Connected` must clear
   the previous SFTP state, and a close with no live session must change nothing.
+  It also covers the config prefill: leaving the Host field fills only untouched
+  values, a typed user/port wins, and a `ProxyJump` alias must put an error in
+  the form without queueing a `Cmd::Connect`.
 * `tests/sshd_e2e.rs` is `#[ignore]`d and needs a server. Env:
   `SSHFTP_TUI_TEST_HOST` / `_PORT` / `_USER` / `_PASSWORD` (defaults
   `127.0.0.1:2222`, `tester`/`testpass`) and `_READONLY`.

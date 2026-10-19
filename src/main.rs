@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use sshftp_tui::app::App;
 use sshftp_tui::event::{Cmd, Evt};
-use sshftp_tui::{network, ui};
+use sshftp_tui::{network, sshconfig, ui};
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
@@ -56,7 +56,12 @@ async fn run(prefill: Option<String>) -> Result<()> {
 
     let network_task = tokio::spawn(network::run(rx_cmd, tx_evt));
 
+    // `~/.ssh/config` is parsed once, before the event loop: the UI task must
+    // not read the disk, and $HOME can be a network mount. An alias on the
+    // command line is resolved by `set_ssh_config` immediately.
+    let ssh_config = sshconfig::SshConfig::load();
     let mut app = App::new(tx_cmd.clone(), prefill);
+    app.set_ssh_config(ssh_config);
     if let Ok(size) = terminal.size() {
         app.on_resize(size.width, size.height);
     }

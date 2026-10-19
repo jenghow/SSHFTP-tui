@@ -151,8 +151,7 @@ What the app does and does not do:
 
 * **No ssh-agent.** The key must be a real file on disk; `SSH_AUTH_SOCK` is
   never contacted.
-* **`~/.ssh/config` is not read** — no `Host` aliases and no `IdentityFile`, so
-  the key path has to be given explicitly.
+* `~/.ssh/config` is read for `Host` aliases — see below.
 * The key, password and passphrase are read when you connect and kept in memory
   for the session; they are never written to disk. Your session is not persisted
   either — the only file the app writes, besides the files you transfer, is
@@ -165,6 +164,43 @@ If it fails, the form shows one of these:
 | `Key file not found: <path>`                     | wrong path, or a bare `~` without a `/`                                                                                                   |
 | `loading private key <path>: ...`                | unreadable file, encrypted key without the right passphrase, or a key type the build does not support                                  |
 | `authentication failed for user <name> ...`      | the key loaded but the server refused it — normally `authorized_keys` or its permissions on the server                                   |
+
+### `~/.ssh/config`
+
+`Host` aliases are resolved, so `sshftp-tui prod` — or typing `prod` in the
+`Host` field and pressing `Tab` — fills the rest of the form:
+
+```
+Host prod
+    HostName 10.0.0.5
+    User deploy
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519_prod
+```
+
+becomes `10.0.0.5`, `deploy`, `2222` and that key path, with a line under the
+fields saying which file and alias supplied them. The `Host` field is replaced
+by the resolved `HostName`, so the form still shows exactly what will be
+dialled, and `known_hosts` is checked against that hostname, as OpenSSH does.
+
+* **Read once at startup** from `SSHFTP_TUI_SSH_CONFIG` if set, otherwise
+  `~/.ssh/config` (`%USERPROFILE%\.ssh\config` on Windows). Edits need a
+  restart.
+* **Only untouched values are filled**: an empty username, port `22`, and the
+  default `~/.ssh/id_ed25519` key path. Anything you typed wins; the `Host`
+  field itself is always replaced by `HostName`.
+* **Supported**: `Host` with whitespace/comma separated patterns, `*`, `?` and
+  `!` negation; `HostName`, `User`, `Port`, `IdentityFile` (the first one
+  only); `Include` (a wildcard in the file name works: `Include config.d/*`);
+  and the `%% %d %h %n %p %r` tokens. OpenSSH's "first value obtained wins"
+  rule applies, so several matching blocks each contribute — a `Host *` block
+  can supply a default user or port.
+* **`ProxyJump` / `ProxyCommand` are refused with an error**, not ignored: this
+  client has no jump-host transport, and dialling the target directly would not
+  be the connection the config describes.
+* Everything else (`Match`, `CanonicalizeHostname`, forwarding options,
+  `UserKnownHostsFile`, agent forwarding, ...) is ignored. The config is never
+  written to.
 
 ### When the session ends
 

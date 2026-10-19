@@ -29,7 +29,9 @@ pub fn known_hosts_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("known_hosts"))
 }
 
-fn home_dir() -> Option<PathBuf> {
+/// The platform's home directory; the known_hosts path and `~` expansion in
+/// `sshconfig` both go through here, so they cannot drift apart.
+pub(crate) fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var_os("USERPROFILE").map(PathBuf::from)
