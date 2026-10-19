@@ -47,8 +47,8 @@ what the Rust toolchain already ships.
   `conhost` console renders the TUI poorly.
 * **Nothing else.** No C toolchain, no `pkg-config`, no system OpenSSL, no
   `libssh2`. `russh` is pinned to
-  `default-features = false, features = ["ring", "flate2"]`, which drops both
-  `aws-lc-rs` (CMake/NASM) and its default `rsa` feature.
+  `default-features = false, features = ["ring", "flate2", "rsa"]`, which drops
+  `aws-lc-rs` (CMake/NASM) while keeping RSA via the pure-Rust `rsa` crates.
 
 ## Build
 
@@ -116,27 +116,24 @@ Path rules:
 
 Accepted key formats:
 
-| Key format                                                              | Supported |
-| ----------------------------------------------------------------------- | --------- |
-| OpenSSH format (`-----BEGIN OPENSSH PRIVATE KEY-----`), ed25519 / ECDSA | yes       |
-| Legacy PEM for ed25519 / ECDSA (PKCS#8, EC `SEC1`)                      | yes       |
-| PuTTY `.ppk`                                                            | yes       |
-| Any of the above, passphrase-encrypted                                  | yes       |
-| RSA (`ssh-rsa`, e.g. `id_rsa`)                                          | **no**    |
+| Key format                                                                    | Supported |
+| ----------------------------------------------------------------------------- | --------- |
+| OpenSSH format (`-----BEGIN OPENSSH PRIVATE KEY-----`), ed25519 / ECDSA / RSA | yes       |
+| Legacy PEM (PKCS#8, EC `SEC1`, RSA `PKCS#1`)                                  | yes       |
+| PuTTY `.ppk` (including RSA)                                                  | yes       |
+| Any of the above, passphrase-encrypted                                        | yes       |
 
-RSA needs explaining: opting out of `russh`'s default features also drops its
-`rsa` feature, so an RSA private key fails with `loading private key <path>`.
-Use an ed25519 key instead —
+RSA is enabled by the `rsa` feature on `russh` (e.g. `~/.ssh/id_rsa`, an EC2
+`.pem`, the key `gcloud compute ssh` writes). It adds only the pure-Rust `rsa`
+and `pkcs1` crates, so there is still no C toolchain, and the modern
+`rsa-sha2-256/512` signatures are used — the ones today's OpenSSH servers
+negotiate. RSA *host* keys work too, so servers that offer no ed25519/ECDSA key
+are reachable.
+
+A newer ed25519 key is still a good idea where you get to choose:
 
 ```sh
 ssh-keygen -t ed25519 -C "me@example.com"       # writes ~/.ssh/id_ed25519{,.pub}
-```
-
-— or rebuild with RSA enabled. That needs no C toolchain (it pulls the pure-Rust
-`rsa`/`pkcs1` crates), just this one line in `Cargo.toml`:
-
-```toml
-russh = { version = "0.64", default-features = false, features = ["ring", "flate2", "rsa"] }
 ```
 
 The public half of the key must be in the account's `authorized_keys` on the
@@ -166,7 +163,7 @@ If it fails, the form shows one of these:
 | Message                                          | Meaning                                                                                                                                  |
 | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `Key file not found: <path>`                     | wrong path, or a bare `~` without a `/`                                                                                                   |
-| `loading private key <path>: ...`                | unreadable file, encrypted key without the right passphrase, or an unsupported type (usually RSA)                                        |
+| `loading private key <path>: ...`                | unreadable file, encrypted key without the right passphrase, or a key type the build does not support                                  |
 | `authentication failed for user <name> ...`      | the key loaded but the server refused it — normally `authorized_keys` or its permissions on the server                                   |
 
 ### When the session ends
@@ -285,9 +282,10 @@ cargo test
 They cover key-sequence encoding, POSIX path helpers, size formatting, the
 connect form and text field (including bracketed IPv6 targets), the strict
 `known_hosts` policy (unknown → match → changed) using two unrelated ed25519
-keys, and the whole rendering layer drawn onto a `ratatui` `TestBackend`
-(connect form, SFTP placeholder, SFTP listings, PTY output, logs, modals,
-footer hints).
+keys, RSA private-key loading (the EC2 `.pem` shape, which is also the guard for
+`russh`'s `rsa` feature), and the whole rendering layer drawn onto a
+`ratatui` `TestBackend` (connect form, SFTP placeholder, SFTP listings, PTY
+output, logs, modals, footer hints).
 
 End-to-end tests drive the same `Cmd`/`Evt` interface the TUI uses against a
 real SSH/SFTP server. Two profiles are supported.
@@ -362,11 +360,6 @@ session was started — i.e. on demand.
 ## Known limitations
 
 * One connection at a time; no session tabs.
-* **RSA is not supported by the default build.** Opting out of `russh`'s
-  default features also disables its `rsa` feature, so both RSA host keys and
-  RSA client keys are rejected. ed25519 and ECDSA keys (and PuTTY `.ppk`) work
-  as-is; add `"rsa"` to the `russh` features for RSA — pure-Rust dependencies,
-  no C toolchain.
 * Symlinked directories are followed during recursive copies, with a depth cap
   of 64 to stop cycles; symlinks themselves are not recreated as links.
 * Existing files are overwritten on copy (the completion message reports how

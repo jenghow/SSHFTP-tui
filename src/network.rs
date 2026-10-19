@@ -5,6 +5,7 @@
 //! * every SFTP/local filesystem request runs in its own spawned task holding
 //!   an `Arc<SftpSession>`, so slow I/O cannot stall the PTY
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -362,6 +363,14 @@ async fn init_sftp(session: &mut Option<Session>, tx: &mpsc::Sender<Evt>) {
     }
 }
 
+/// Reads the client key with the error context the login form shows. The RSA
+/// formats (`BEGIN RSA PRIVATE KEY`, e.g. the `.pem` EC2 hands out) only decode
+/// when `russh`'s `rsa` feature is on — see `rsa_client_keys_load`.
+fn load_client_key(path: &Path, passphrase: Option<&str>) -> Result<russh::keys::PrivateKey> {
+    russh::keys::load_secret_key(path, passphrase)
+        .with_context(|| format!("loading private key {}", path.display()))
+}
+
 async fn connect(params: &ConnectParams, tx: &mpsc::Sender<Evt>) -> Result<Session> {
     let config = Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
@@ -398,8 +407,9 @@ async fn connect(params: &ConnectParams, tx: &mpsc::Sender<Evt>) -> Result<Sessi
                 .await?
         }
         AuthMethod::KeyFile { path, passphrase } => {
-            let key = russh::keys::load_secret_key(path, passphrase.as_deref())
-                .with_context(|| format!("loading private key {}", path.display()))?;
+            let key = load_client_key(path, passphrase.as_deref())?;
+            // `Some` only for RSA keys whose server advertised `rsa-sha2-*` in
+            // `server-sig-algs`; SHA-1 remains the fallback (`None`).
             let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
             handle
                 .authenticate_publickey(
@@ -476,4 +486,82 @@ async fn connect(params: &ConnectParams, tx: &mpsc::Sender<Evt>) -> Result<Sessi
         write: write_half,
         sftp: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    /// A throwaway 2048-bit RSA key in the legacy PKCS#1 PEM encoding — the
+    /// shape EC2 hands out (`ssh-keygen -m PEM` produces the same). Decoding it
+    /// and signing with it is the cheapest end-to-end check that `russh`'s
+    /// `rsa` feature is still on: without it the `BEGIN RSA PRIVATE KEY` header
+    /// is refused outright (and signing returns `AlgorithmUnsupported`), so this
+    /// fails in the build rather than in the field.
+    const RSA_PEM: &str = r"-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAqQXmZ73nI4keiEKfxagBnFy1+sCK0fA+lMwMskeSroHNkei+
+5LnKMF/HwNSQl9OhVb1seKSI778dhO4Ws+TvqQpC+gukHhc+9302Qc2z0J5MRcjK
+Jy2bkpSSGISG95qzqI3mUYj7sL0fA8TVQt6Lz9lNSv1UU34xL5s8jqW7O9h/vHCD
+QyhohExneB8aV7Ax73dfH6r1fRTTNfuejZ/d/ok07eyIXfxXnAXIMttHPus377TJ
+dNusWanqDyW65y2Q97gU5PY1SqYOhHIM47SMTCWE36DWYPI6UAVEdIim+BeUNpRB
+2ZmGXCGVvyBIXgXULjzIJmy9kfNoMg1Jy/GGLQIDAQABAoIBABS6UYAlbMQR27mw
+GfHeYZwwTmza0ete//21bFUsq9NUvcYH+ekI07/M7y05pCXKYT2nhjbhTp3AHTmh
+DQ2wpKdhR8dsSAscpK8rHs1BEa0izI2+SvQ1BqAaMjRphDe3NBMWm8kh+GO7PaNz
+rweNTS4HIxBwMrgugI+rBOklb+mtty7gSuGEJ0I1xVVTIgt+HCL3GnfNTx9VpS7w
+KuxQl4gZ2y76Enbcp9j+Y2seakDkI53Ufox6DW3nTrdG6YIpjH8aRnxXim93bfPB
+RYiYQzH7quIrhy3WWCP+N59+ElYH+0DPzItnCkCf1D3o+wDSy9R8RTRM4M9oabGE
+AKfspsECgYEA0ge8oRXqI52awc8iFmych28YAcT/s5Fezg27pUb05smG6wIVNa/l
+1PGSRQC9wtMgw6KzWKzWQwzGNE3BP2Qx5orBQoWZ54ckEWTBSwo1ZgdeRh2M1N4X
+u2YhtkYqkYBD6A6tIBfl+O0IJCPKl9Fm/bpEGBALiRt3YCX4z3nm35ECgYEAzgR6
+fiIwc8bXHtMdVYFB3T2JtwXBv3ao6YW58SuLd96tApOZ3XbZ/+PPdUKOfKOl3wpF
+TnoXH9l2uOPmm4VvFDAJiEucbihbj6PnYBkUxKoK1z340w7sx6eHQjCbX7ahVhCN
+nU6JCkZ8EF5s4ZOqkg5sASJistA01mQhZ4/DJt0CgYEAyLeaHfvaedT5e7Re6D09
+zfRuZeqFT29iwdq/9DB+hTwc0uR3ron+Q+XlGkqeDt1EF5KagOkUDpnbpUqVnuY7
+Bg6eqNsS/P/aiUDXtMX5yBrMjodY+mmRFoeBOjeOIOUKgG/eJaiRH7YurJMD3tjA
+60QiJTjYPVxhViKTyHvAFvECgYEAieWvhBwoaGaQ+X4AJYqWZptZQdulmx225FBx
+bL9j5EF1dsMLe5ShSMnYxDlfnIgBb/C1AVlxfw0VjZ5mbnT7K/0XdFaAB7AV0Wi5
+Z7aCEz1qcjZ2Bff4f49gVuqoJYHeLfh4gfHegrU5N8+se7VWt9rValD01ZHNvC9b
+uLEexDUCgYAHe+/eq3DsRNiR44+TddhFrzoaY+RH1RwZP8Sep4O449VIJnM0ORcU
+suV3ZQgsE5QyID/PMNSC1Z7noknWHeI2MQfqi4JJ7aYzF54Of4w2eAffmwk4Dx6M
+XZsScVEvmrBSeuRllzWhHOacnwe6aM2ya7YlpqakBH2KliNJPSENUg==
+-----END RSA PRIVATE KEY-----";
+
+    fn scratch_key(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sshftp-tui-{tag}-{nanos}"));
+        std::fs::write(&path, RSA_PEM).expect("writing the fixture");
+        path
+    }
+
+    #[test]
+    fn rsa_client_keys_load() {
+        let path = scratch_key("rsa-key");
+
+        let key = load_client_key(&path, None).expect("RSA client keys must load");
+        assert!(key.algorithm().is_rsa(), "{}", key.algorithm());
+        assert!(
+            key.fingerprint(russh::keys::HashAlg::Sha256)
+                .to_string()
+                .starts_with("SHA256:"),
+            "an RSA key still produces a public fingerprint"
+        );
+
+        // The handshake path, minus the server: sign with the private half and
+        // verify with the public one. This is what `AlgorithmUnsupported` used
+        // to break.
+        let signature = key
+            .sign("sshftp-tui", russh::keys::HashAlg::Sha512, b"login banner")
+            .expect("RSA signatures must be supported");
+        key.public_key()
+            .verify("sshftp-tui", b"login banner", &signature)
+            .expect("the RSA signature verifies");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

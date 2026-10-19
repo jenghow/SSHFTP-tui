@@ -34,8 +34,12 @@ the e2e test uses it once, before any thread reads the variable.
 
 ## Don't "fix" these dependency pins
 
-* `russh = { default-features = false, features = ["ring", "flate2"] }`. The
-  defaults pull `aws-lc-rs`, which needs CMake/NASM and a C toolchain.
+* `russh = { default-features = false, features = ["ring", "flate2", "rsa"] }`.
+  The defaults pull `aws-lc-rs`, which needs CMake/NASM and a C toolchain. `rsa`
+  is deliberately kept and is *not* an excuse to re-enable the defaults: it is
+  the pure-Rust `rsa`/`pkcs1` pair, and without it RSA host keys and the RSA
+  client keys the clouds hand out (EC2 `.pem`, `gcloud compute ssh`, Azure)
+  fail to load or verify.
 * `crossterm = "0.29"` must stay in step with the crossterm `ratatui 0.30`
   depends on; bumping one alone puts two versions in the graph.
 * No `tui-input`: `form::TextField` (char-index cursor) is hand-written.
@@ -127,8 +131,11 @@ the e2e test uses it once, before any thread reads the variable.
 
 * Unit tests cover key encoding, POSIX path helpers, size formatting,
   form/`TextField` (including bracketed IPv6), host-key policy using two
-  embedded ed25519 keys, and the render layer via `ratatui::backend::TestBackend`
-  (asserts on `Buffer.content` symbols).
+  embedded ed25519 keys, RSA private-key loading (an EC2-style PKCS#1 PEM in
+  `network::tests`, which is the guard that `russh`'s `rsa` feature is still
+  enabled — it fails with `UnsupportedKeyType` if it is dropped), and the render
+  layer via `ratatui::backend::TestBackend` (asserts on `Buffer.content`
+  symbols).
 * `app.rs` has its own `mod tests` for key routing, because that logic is
   invisible to the render tests: the F6/F7 dialogs must survive a keystroke
   (`on_modal_key` takes the modal out of `App` and has to put it back), and

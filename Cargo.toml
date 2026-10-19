@@ -19,7 +19,11 @@ tokio = { version = "1", features = [
     "time",
 ] }
 futures = "0.3"
-russh = { version = "0.64", default-features = false, features = ["ring", "flate2"] }
+russh = { version = "0.64", default-features = false, features = [
+    "ring",
+    "flate2",
+    "rsa",
+] }
 russh-sftp = "3.0"
 vt100 = "0.17"
 anyhow = "1"
