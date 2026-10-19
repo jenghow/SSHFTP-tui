@@ -1,0 +1,27 @@
+# Build output
+/target
+
+# Local scratch files
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+tests/sshd/hostkeys/
+
+# Rust
+*.rs.bk
+
+# Editors and IDEs
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

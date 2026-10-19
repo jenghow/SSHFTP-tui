@@ -1,0 +1,25 @@
+Port 2222
+
+# Host keys live on a mounted volume so they survive container restarts; the
+# "changed key" test resets the volume to get fresh ones.
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+HostKey /etc/ssh/keys/ssh_host_rsa_key
+
+# VERBOSE makes sshd log "subsystem request for sftp", which is how the
+# "no SFTP until F3" behaviour is observed in the container log.
+LogLevel VERBOSE
+
+PasswordAuthentication yes
+PermitEmptyPasswords no
+PermitRootLogin no
+UsePAM no
+StrictModes no
+AllowUsers tester
+
+PrintMotd no
+PrintLastLog no
+PidFile /run/sshd.pid
+
+# Pure internal-sftp: no external sftp-server binary, no ambiguity about which
+# subsystem implementation is actually used.
+Subsystem sftp internal-sftp

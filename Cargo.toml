@@ -1,0 +1,32 @@
+[package]
+name = "sshftp-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cross-platform TUI SSH + SFTP client built on russh and ratatui"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "fs",
+    "sync",
+    "time",
+] }
+futures = "0.3"
+russh = { version = "0.64", default-features = false, features = ["ring", "flate2"] }
+russh-sftp = "3.0"
+vt100 = "0.17"
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
