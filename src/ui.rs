@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
-use crate::app::{App, Focus, Modal, Pane, Screen, SftpState, Tab};
+use crate::app::{App, Focus, Modal, Pane, Screen, SftpState, SortKey, Tab};
 use crate::event::{LogLevel, PaneKind};
 use crate::form::{AuthKind, Field};
 
@@ -192,29 +192,65 @@ fn draw_pane(frame: &mut Frame, pane: &mut Pane, kind: PaneKind, focused: bool, 
     } else {
         Color::DarkGray
     };
-    let title = format!(" {}: {} ", kind.label(), pane.cwd);
+    let title = if pane.filter().is_empty() {
+        format!(" {}: {} ", kind.label(), pane.cwd)
+    } else {
+        format!(
+            " {}: {}  [find: {}] ",
+            kind.label(),
+            pane.cwd,
+            pane.filter()
+        )
+    };
 
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::new().fg(border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (body, find_area) = if pane.is_searching() {
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+
+    let marker = if pane.sort_descending() { "▼" } else { "▲" };
+    let name_header = if pane.sort_key() == SortKey::Name {
+        format!("Name {marker}")
+    } else {
+        "Name".to_string()
+    };
+    let size_header = if pane.sort_key() == SortKey::Size {
+        format!("Size {marker}")
+    } else {
+        "Size".to_string()
+    };
     let header = Row::new(vec![
-        Cell::from("Name"),
-        Cell::from("Size"),
+        Cell::from(name_header),
+        Cell::from(size_header),
         Cell::from("Date"),
     ])
     .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD));
 
-    let rows = pane.entries.iter().map(|entry| {
-        let name_style = if entry.is_dir {
-            Style::new().fg(Color::LightCyan)
-        } else if entry.is_symlink {
-            Style::new().fg(Color::LightMagenta)
-        } else {
-            Style::new().fg(Color::Gray)
-        };
-        Row::new(vec![
-            Cell::from(entry.display_name()).style(name_style),
-            Cell::from(entry.size_text()).style(Style::new().fg(Color::DarkGray)),
-            Cell::from(entry.date_text()).style(Style::new().fg(Color::DarkGray)),
-        ])
-    });
+    let rows: Vec<Row> = pane
+        .visible()
+        .map(|entry| {
+            let name_style = if entry.is_dir {
+                Style::new().fg(Color::LightCyan)
+            } else if entry.is_symlink {
+                Style::new().fg(Color::LightMagenta)
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            Row::new(vec![
+                Cell::from(entry.display_name()).style(name_style),
+                Cell::from(entry.size_text()).style(Style::new().fg(Color::DarkGray)),
+                Cell::from(entry.date_text()).style(Style::new().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
 
     let table = Table::new(
         rows,
@@ -225,11 +261,6 @@ fn draw_pane(frame: &mut Frame, pane: &mut Pane, kind: PaneKind, focused: bool, 
         ],
     )
     .header(header)
-    .block(
-        Block::bordered()
-            .title(title)
-            .border_style(Style::new().fg(border)),
-    )
     .row_highlight_style(
         Style::new()
             .bg(Color::DarkGray)
@@ -237,7 +268,34 @@ fn draw_pane(frame: &mut Frame, pane: &mut Pane, kind: PaneKind, focused: bool, 
     )
     .highlight_symbol("> ");
 
-    frame.render_stateful_widget(table, area, &mut pane.state);
+    frame.render_stateful_widget(table, body, &mut pane.state);
+
+    if let (Some(field), Some(find_area)) = (pane.search_field(), find_area) {
+        let prompt = "Find: ";
+        let prompt_width = prompt.chars().count();
+        let available = (find_area.width as usize).saturating_sub(prompt_width);
+        let cursor = field.cursor.min(field.char_len());
+        // Keep the caret in view by scrolling the text window when it would
+        // otherwise run past the right edge.
+        let offset = cursor.saturating_sub(available.saturating_sub(1));
+        let text: String = field.value.chars().skip(offset).take(available).collect();
+        let line = Line::from(vec![
+            Span::styled(
+                prompt,
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::new().fg(Color::LightGreen)),
+        ]);
+        frame.render_widget(Paragraph::new(line), find_area);
+
+        if available > 0 {
+            let x = find_area.x + (prompt_width + cursor - offset) as u16;
+            frame.set_cursor_position(Position::new(
+                x.min(find_area.right().saturating_sub(1)),
+                find_area.y,
+            ));
+        }
+    }
 }
 
 fn draw_placeholder(frame: &mut Frame, area: Rect, state: &SftpState, focused: bool) {
@@ -321,7 +379,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
         Tab::Terminal => "[Ctrl+T] Tab Change   [F10] Exit".to_string(),
         Tab::Sftp => format!(
-            "Focus: {}  F3 Init  Tab Pane  Enter Open  F4 Refresh  F5 Copy  F6 Rename  F7 Mkdir  F8 Delete  F9 Chdir",
+            "Focus: {}  F3 Init  Tab Pane  Enter  F4 Refr  F5 Copy  F6 Ren  F7 Mkdir  F8 Del  F9 Chdir  / Find  s Sort",
             app.focus.label()
         ),
         Tab::Logs => {
@@ -814,6 +872,61 @@ mod tests {
         assert!(text.contains("docs/"), "{text}");
         assert!(text.contains("notes.txt"), "{text}");
         assert!(text.contains("2.0K"), "{text}");
+    }
+
+    #[test]
+    fn sftp_header_marks_the_active_sort_column() {
+        let (mut app, _rx) = app();
+        app.screen = Screen::Main;
+        app.tab = Tab::Sftp;
+        app.sftp = SftpState::Ready;
+        app.focus = Focus::Remote;
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![dir("docs"), file("notes.txt", 2048)],
+        );
+
+        let text = render(&mut app, 140, 30);
+        assert!(text.contains("Name ▲"), "{text}");
+        assert!(!text.contains("Size ▲"), "{text}");
+
+        app.remote.cycle_sort();
+        let text = render(&mut app, 140, 30);
+        assert!(text.contains("Size ▲"), "{text}");
+
+        app.remote.toggle_sort_direction();
+        let text = render(&mut app, 140, 30);
+        assert!(text.contains("Size ▼"), "{text}");
+    }
+
+    #[test]
+    fn find_bar_filters_the_focused_pane_and_draws_a_caret() {
+        let (mut app, _rx) = app();
+        app.screen = Screen::Main;
+        app.tab = Tab::Sftp;
+        app.sftp = SftpState::Ready;
+        app.focus = Focus::Remote;
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![dir("docs"), file("notes.txt", 12), file("other.log", 34)],
+        );
+        app.remote.begin_search();
+        app.remote.search_insert('n');
+        app.remote.search_insert('o');
+
+        let (text, cursor) = render_with_cursor(&mut app, 140, 30);
+        assert!(text.contains("Find: no"), "{text}");
+        assert!(text.contains("notes.txt"), "{text}");
+        assert!(!text.contains("other.log"), "{text}");
+        assert!(!text.contains("docs/"), "{text}");
+        let (row, first) = locate(&text, "Find: no");
+        assert_eq!(cursor, Position::new(first + 8, row), "{text}");
+
+        app.remote.search_commit();
+        let text = render(&mut app, 140, 30);
+        assert!(text.contains("[find: no]"), "{text}");
+        assert!(text.contains("notes.txt"), "{text}");
+        assert!(!text.contains("other.log"), "{text}");
     }
 
     #[test]

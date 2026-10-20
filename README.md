@@ -261,6 +261,17 @@ SFTP tab:
 | `F7`          | Create a directory                           |
 | `F8`          | Delete (directories are removed recursively) |
 | `F9`          | Change directory (type a path; `Ctrl+U` clears) |
+| `/`           | Filter the focused pane (type to search; `Enter` keeps it, `Esc` clears) |
+| `s`           | Cycle the sort column: name → size               |
+| `S`           | Reverse the current sort direction                |
+
+Sorting and filtering are applied locally to the listing already on screen, so
+changing them never sends a request to the server. Directories stay grouped
+first whichever column is active; within the directory group and for files
+`Name` is case-insensitive, and `Size` uses the numeric byte count. A refresh
+keeps both settings, while entering another directory starts with a blank
+filter. While the `Find:` field is open, printable keys edit the filter and
+`Up`/`Down` move through the matches.
 
 Logs tab: `Up`/`Down`/`PgUp`/`PgDn` scroll, `End` resumes following.
 

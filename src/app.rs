@@ -97,10 +97,49 @@ impl SftpState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Size,
+}
+
+impl SortKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Size => "size",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Size,
+            Self::Size => Self::Name,
+        }
+    }
+}
+
+/// Case-insensitive name order with an exact-case tie-break.
+fn name_order(left: &FsEntry, right: &FsEntry) -> std::cmp::Ordering {
+    left.name
+        .to_lowercase()
+        .cmp(&right.name.to_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
+}
+
 pub struct Pane {
     pub cwd: String,
+    /// The complete listing. [`Pane::view`] holds the indices that survive the
+    /// current filter, in display order.
     pub entries: Vec<FsEntry>,
+    view: Vec<usize>,
     pub state: TableState,
+    sort: SortKey,
+    descending: bool,
+    filter: String,
+    /// `Some` while the inline search field is open. The field's text is kept
+    /// in sync with `filter` on every edit.
+    search: Option<TextField>,
 }
 
 impl Pane {
@@ -108,54 +147,227 @@ impl Pane {
         Self {
             cwd: cwd.into(),
             entries: Vec::new(),
+            view: Vec::new(),
             state: TableState::default(),
+            sort: SortKey::Name,
+            descending: false,
+            filter: String::new(),
+            search: None,
         }
     }
 
+    pub fn visible(&self) -> impl Iterator<Item = &FsEntry> + '_ {
+        self.view
+            .iter()
+            .filter_map(|&index| self.entries.get(index))
+    }
+
     pub fn selected(&self) -> Option<&FsEntry> {
-        self.state.selected().and_then(|i| self.entries.get(i))
+        self.state
+            .selected()
+            .and_then(|index| self.view.get(index))
+            .and_then(|&index| self.entries.get(index))
     }
 
     pub fn selected_name(&self) -> Option<String> {
         self.selected().map(|e| e.name.clone())
     }
 
+    pub fn sort_key(&self) -> SortKey {
+        self.sort
+    }
+
+    pub fn sort_descending(&self) -> bool {
+        self.descending
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub fn search_field(&self) -> Option<&TextField> {
+        self.search.as_ref()
+    }
+
     /// Replace the listing, keeping the selection on the same name when
-    /// possible. This makes refresh/rename feel stable.
+    /// possible. This makes refresh/rename feel stable. A new directory starts
+    /// with a blank filter, while refreshing the same one keeps it.
     pub fn set_entries(&mut self, cwd: String, entries: Vec<FsEntry>) {
         let previous = self.selected_name();
+        let changed_dir = cwd != self.cwd;
         self.cwd = cwd;
         self.entries = entries;
-        let index = previous
-            .and_then(|name| self.entries.iter().position(|e| e.name == name))
-            .or(if self.entries.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
+        if changed_dir {
+            self.filter.clear();
+            self.search = None;
+        }
+        self.rebuild(previous);
+    }
+
+    /// Recompute [`Pane::view`] from the current filter and sort, then keep the
+    /// selection on `select` (a filename) when it is still visible.
+    fn rebuild(&mut self, select: Option<String>) {
+        let needle = self.filter.to_lowercase();
+        self.view = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect();
+
+        let sort = self.sort;
+        let descending = self.descending;
+        self.view.sort_by(|&a, &b| {
+            let left = &self.entries[a];
+            let right = &self.entries[b];
+            // Directories stay grouped first in either direction: their size
+            // is not meaningful, and this matches the order the network layer
+            // already produces.
+            if left.is_dir != right.is_dir {
+                return right.is_dir.cmp(&left.is_dir);
+            }
+            match sort {
+                SortKey::Name => {
+                    let order = name_order(left, right);
+                    if descending { order.reverse() } else { order }
+                }
+                SortKey::Size if left.is_dir => name_order(left, right),
+                SortKey::Size => {
+                    let order = left.size.cmp(&right.size);
+                    let order = if descending { order.reverse() } else { order };
+                    order.then_with(|| name_order(left, right))
+                }
+            }
+        });
+
+        let index = select
+            .and_then(|name| {
+                self.view
+                    .iter()
+                    .position(|&index| self.entries[index].name == name)
+            })
+            .or(if self.view.is_empty() { None } else { Some(0) });
         self.state.select(index);
+        *self.state.offset_mut() = 0;
+    }
+
+    pub fn cycle_sort(&mut self) {
+        let previous = self.selected_name();
+        self.sort = self.sort.next();
+        self.descending = false;
+        self.rebuild(previous);
+    }
+
+    pub fn toggle_sort_direction(&mut self) {
+        let previous = self.selected_name();
+        self.descending = !self.descending;
+        self.rebuild(previous);
+    }
+
+    pub fn begin_search(&mut self) {
+        self.search = Some(TextField::new(self.filter.clone()));
+    }
+
+    /// Copy the field into the filter and re-derive the visible rows.
+    fn sync_filter(&mut self) {
+        let previous = self.selected_name();
+        if let Some(field) = self.search.as_ref() {
+            self.filter = field.value.clone();
+        }
+        self.rebuild(previous);
+    }
+
+    pub fn search_insert(&mut self, c: char) {
+        if let Some(field) = self.search.as_mut() {
+            field.insert(c);
+        }
+        self.sync_filter();
+    }
+
+    pub fn search_backspace(&mut self) {
+        if let Some(field) = self.search.as_mut() {
+            field.backspace();
+        }
+        self.sync_filter();
+    }
+
+    pub fn search_delete(&mut self) {
+        if let Some(field) = self.search.as_mut() {
+            field.delete();
+        }
+        self.sync_filter();
+    }
+
+    pub fn search_clear(&mut self) {
+        if let Some(field) = self.search.as_mut() {
+            *field = TextField::default();
+        }
+        self.sync_filter();
+    }
+
+    pub fn search_left(&mut self) {
+        if let Some(field) = self.search.as_mut() {
+            field.left();
+        }
+    }
+
+    pub fn search_right(&mut self) {
+        if let Some(field) = self.search.as_mut() {
+            field.right();
+        }
+    }
+
+    pub fn search_home(&mut self) {
+        if let Some(field) = self.search.as_mut() {
+            field.home();
+        }
+    }
+
+    pub fn search_end(&mut self) {
+        if let Some(field) = self.search.as_mut() {
+            field.end();
+        }
+    }
+
+    /// Close the field but keep the filter applied.
+    pub fn search_commit(&mut self) {
+        self.search = None;
+    }
+
+    /// Close the field and show the whole directory again.
+    pub fn search_cancel(&mut self) {
+        let previous = self.selected_name();
+        self.search = None;
+        self.filter.clear();
+        self.rebuild(previous);
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.entries.is_empty() {
+        if self.view.is_empty() {
             self.state.select(None);
             return;
         }
         let current = self.state.selected().unwrap_or(0) as isize;
-        let last = self.entries.len() as isize - 1;
+        let last = self.view.len() as isize - 1;
         self.state
             .select(Some((current + delta).clamp(0, last) as usize));
     }
 
     pub fn select_first(&mut self) {
-        if !self.entries.is_empty() {
+        if !self.view.is_empty() {
             self.state.select(Some(0));
+            *self.state.offset_mut() = 0;
         }
     }
 
     pub fn select_last(&mut self) {
-        if !self.entries.is_empty() {
-            self.state.select(Some(self.entries.len() - 1));
+        if !self.view.is_empty() {
+            self.state.select(Some(self.view.len() - 1));
         }
     }
 }
@@ -632,6 +844,15 @@ impl App {
     }
 
     async fn on_sftp_key(&mut self, key: KeyEvent) {
+        // The inline find field owns every key while it is open; otherwise its
+        // characters would trigger the pane shortcuts.
+        if self.pane(self.focus).is_searching() {
+            self.on_search_key(key).await;
+            return;
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::F(3) => self.init_sftp().await,
             KeyCode::Tab | KeyCode::BackTab => self.focus = self.focus.toggled(),
@@ -649,8 +870,82 @@ impl App {
             KeyCode::F(7) => self.open_mkdir_modal(),
             KeyCode::F(8) => self.open_delete_modal(),
             KeyCode::F(9) => self.open_chdir_modal(),
+            KeyCode::Char('/') if !ctrl && !alt => {
+                if self.focus == Focus::Remote && !self.sftp.is_ready() {
+                    self.set_status("Press [F3] to initialize the SFTP session first");
+                } else {
+                    self.pane_mut(self.focus).begin_search();
+                    self.set_status("Type to filter; Enter keeps it, Esc clears it");
+                }
+            }
+            KeyCode::Char('s') if !ctrl && !alt => self.cycle_sort(),
+            KeyCode::Char('S') if !ctrl && !alt => self.reverse_sort(),
             _ => {}
         }
+    }
+
+    /// Keys while the inline find field is open. Only editing keys and
+    /// navigation are accepted; `Enter` keeps the filter and opens the
+    /// selection, `Esc` drops back to the full directory.
+    async fn on_search_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.pane_mut(self.focus).search_cancel(),
+            KeyCode::Enter => {
+                self.pane_mut(self.focus).search_commit();
+                self.open_selected().await;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.pane_mut(self.focus).search_commit();
+                self.focus = self.focus.toggled();
+            }
+            KeyCode::Up => self.pane_mut(self.focus).move_selection(-1),
+            KeyCode::Down => self.pane_mut(self.focus).move_selection(1),
+            KeyCode::PageUp => self.pane_mut(self.focus).move_selection(-10),
+            KeyCode::PageDown => self.pane_mut(self.focus).move_selection(10),
+            KeyCode::Char('u') if ctrl => self.pane_mut(self.focus).search_clear(),
+            KeyCode::Backspace => self.pane_mut(self.focus).search_backspace(),
+            KeyCode::Delete => self.pane_mut(self.focus).search_delete(),
+            KeyCode::Left => self.pane_mut(self.focus).search_left(),
+            KeyCode::Right => self.pane_mut(self.focus).search_right(),
+            KeyCode::Home => self.pane_mut(self.focus).search_home(),
+            KeyCode::End => self.pane_mut(self.focus).search_end(),
+            KeyCode::Char(c) if !ctrl && !alt => self.pane_mut(self.focus).search_insert(c),
+            _ => {}
+        }
+    }
+
+    fn cycle_sort(&mut self) {
+        let (key, descending) = {
+            let pane = self.pane_mut(self.focus);
+            pane.cycle_sort();
+            (pane.sort_key().label(), pane.sort_descending())
+        };
+        self.set_status(format!(
+            "Sort: {key} {}",
+            if descending {
+                "descending"
+            } else {
+                "ascending"
+            }
+        ));
+    }
+
+    fn reverse_sort(&mut self) {
+        let (key, descending) = {
+            let pane = self.pane_mut(self.focus);
+            pane.toggle_sort_direction();
+            (pane.sort_key().label(), pane.sort_descending())
+        };
+        self.set_status(format!(
+            "Sort: {key} {}",
+            if descending {
+                "descending"
+            } else {
+                "ascending"
+            }
+        ));
     }
 
     fn on_logs_key(&mut self, key: KeyEvent) {
@@ -1467,6 +1762,19 @@ mod tests {
     }
 
     #[test]
+    fn find_is_refused_until_sftp_is_ready() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        app.sftp = SftpState::NotInitialized;
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Char('/'))));
+
+        assert!(!app.remote.is_searching());
+        assert!(app.status.contains("[F3]"), "{}", app.status);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn empty_chdir_stays_open_with_an_error() {
         let (mut app, mut rx) = sftp_app(Focus::Remote);
         futures::executor::block_on(app.on_key(press(KeyCode::F(9))));
@@ -1506,6 +1814,163 @@ mod tests {
         assert_eq!(input_field(&app).cursor, 0);
         assert!(matches!(app.modal, Some(Modal::Input(_))));
         assert!(rx.try_recv().is_err());
+    }
+
+    fn entry(name: &str, is_dir: bool, size: u64) -> FsEntry {
+        FsEntry {
+            name: name.to_string(),
+            is_dir,
+            is_symlink: false,
+            size,
+            modified: None,
+        }
+    }
+
+    fn visible_names(pane: &Pane) -> Vec<String> {
+        pane.visible().map(|entry| entry.name.clone()).collect()
+    }
+
+    #[test]
+    fn sorting_by_size_keeps_directories_first() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![
+                entry("big.bin", false, 900),
+                entry("small.txt", false, 10),
+                entry("docs", true, 0),
+                entry("archive", true, 0),
+            ],
+        );
+        drain(&mut rx);
+
+        assert_eq!(
+            visible_names(&app.remote),
+            ["archive", "docs", "big.bin", "small.txt"],
+            "the default is name order with directories first"
+        );
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Char('s'))));
+        assert_eq!(
+            visible_names(&app.remote),
+            ["archive", "docs", "small.txt", "big.bin"],
+            "size order still groups directories first"
+        );
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Char('S'))));
+        assert_eq!(
+            visible_names(&app.remote),
+            ["archive", "docs", "big.bin", "small.txt"],
+            "reversing sorts the files but keeps the directory group first"
+        );
+        assert!(rx.try_recv().is_err(), "sorting never leaves the UI");
+    }
+
+    #[test]
+    fn sorting_keeps_the_selected_name() {
+        let (mut app, _rx) = sftp_app(Focus::Remote);
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![
+                entry("archive", true, 0),
+                entry("docs", true, 0),
+                entry("big.bin", false, 900),
+                entry("small.txt", false, 10),
+            ],
+        );
+        app.remote.state.select(Some(2));
+        assert_eq!(app.remote.selected_name().as_deref(), Some("big.bin"));
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Char('s'))));
+
+        assert_eq!(app.remote.selected_name().as_deref(), Some("big.bin"));
+    }
+
+    #[test]
+    fn find_filters_the_listing_and_escape_restores_it() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![
+                entry("docs", true, 0),
+                entry("notes.txt", false, 12),
+                entry("other.log", false, 34),
+            ],
+        );
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Char('/'))));
+        assert!(app.remote.is_searching());
+        for c in "NOT".chars() {
+            futures::executor::block_on(app.on_key(press(KeyCode::Char(c))));
+        }
+
+        assert_eq!(app.remote.filter(), "NOT");
+        assert_eq!(visible_names(&app.remote), ["notes.txt"]);
+        assert_eq!(app.remote.sort_key(), SortKey::Name, "typing does not sort");
+        assert!(rx.try_recv().is_err(), "filtering never leaves the UI");
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Esc)));
+
+        assert!(!app.remote.is_searching());
+        assert!(app.remote.filter().is_empty());
+        assert_eq!(visible_names(&app.remote).len(), 3);
+    }
+
+    #[test]
+    fn a_new_directory_drops_the_previous_filter() {
+        let (mut app, mut rx) = sftp_app(Focus::Remote);
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![entry("docs", true, 0), entry("notes.txt", false, 12)],
+        );
+        futures::executor::block_on(app.on_key(press(KeyCode::Char('/'))));
+        for c in "doc".chars() {
+            futures::executor::block_on(app.on_key(press(KeyCode::Char(c))));
+        }
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+        match rx.try_recv() {
+            Ok(Cmd::SftpList { path }) => assert_eq!(path, "/home/tester/docs"),
+            Ok(_) => panic!("expected Cmd::SftpList"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+
+        futures::executor::block_on(app.on_event(Evt::SftpListing {
+            path: "/home/tester/docs".to_string(),
+            entries: vec![entry("readme.md", false, 5)],
+        }));
+
+        assert!(app.remote.filter().is_empty());
+        assert!(!app.remote.is_searching());
+        assert_eq!(visible_names(&app.remote), ["readme.md"]);
+    }
+
+    #[test]
+    fn refreshing_the_same_directory_keeps_the_filter_and_sort() {
+        let (mut app, _rx) = sftp_app(Focus::Remote);
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![entry("alpha.log", false, 30), entry("beta.txt", false, 10)],
+        );
+        app.remote.cycle_sort();
+        app.remote.begin_search();
+        app.remote.search_insert('l');
+        app.remote.search_commit();
+
+        app.remote.set_entries(
+            "/home/tester".to_string(),
+            vec![
+                entry("alpha.log", false, 30),
+                entry("beta.txt", false, 10),
+                entry("later.log", false, 20),
+            ],
+        );
+
+        assert_eq!(app.remote.sort_key(), SortKey::Size);
+        assert_eq!(app.remote.filter(), "l");
+        assert_eq!(visible_names(&app.remote), ["later.log", "alpha.log"]);
     }
 
     #[test]

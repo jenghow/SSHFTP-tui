@@ -105,7 +105,12 @@ the e2e test uses it once, before any thread reads the variable.
   `local_normalize`/`remote_normalize` (pure string folding, so `..` and
   `sub/./x` work and the remote path never grows a backslash), and sends the
   usual `Cmd::LocalList`/`Cmd::SftpList` — no new command, no filesystem probe
-  on the UI task. `Ctrl+U` clears a dialog field.
+  on the UI task. `Ctrl+U` clears a dialog field. Also local to the SFTP tab:
+  `/` opens the inline find field, `s` cycles Name→Size and `S` reverses the
+  order. Those two are pure UI over the listing already delivered: `Pane` keeps
+  the full `entries` and a `view` of indices (filter, then sort), so toggling
+  them must never send a `Cmd`. Directories stay first in both sort keys, and a
+  new directory clears the filter while refreshing the same one keeps it.
 * **Terminal scrollback lives in the parser, not in `App`.** `vt100::Parser` is
   built with 2000 lines of history and the view offset is driven by
   `parser.screen_mut().set_scrollback(n)`, which clamps to what exists (use
