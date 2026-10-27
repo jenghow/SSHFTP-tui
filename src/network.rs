@@ -20,6 +20,7 @@ use crate::event::{
     AuthMethod, Cmd, ConnectParams, Evt, LogLevel, PaneKind, local_parent, remote_parent,
 };
 use crate::hostkey::{self, HostKeyStatus};
+use crate::saved;
 use crate::sftp;
 
 struct Session {
@@ -159,6 +160,36 @@ async fn handle(session: &mut Option<Session>, cmd: Cmd, tx: &mpsc::Sender<Evt>)
                     }
                     Err(err) => {
                         let _ = tx.send(Evt::Error(format!("{err:#}"))).await;
+                    }
+                }
+            });
+        }
+
+        Cmd::SaveConnection { path, entry } => {
+            // Local disk, but still not the UI task; spawning keeps a home
+            // directory on a network mount from stalling the PTY supervisor.
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    let entry = entry.clone();
+                    move || saved::append_at(&path, &entry)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        let _ = tx.send(Evt::ConnectionSaved(entry)).await;
+                    }
+                    Ok(Err(err)) => {
+                        let _ = tx.send(Evt::ConnectionSaveFailed(format!("{err:#}"))).await;
+                    }
+                    Err(err) => {
+                        let _ = tx
+                            .send(Evt::ConnectionSaveFailed(format!(
+                                "the save task failed: {err}"
+                            )))
+                            .await;
                     }
                 }
             });
@@ -563,5 +594,53 @@ XZsScVEvmrBSeuRllzWhHOacnwe6aM2ya7YlpqakBH2KliNJPSENUg==
             .expect("the RSA signature verifies");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_save_command_writes_the_block_and_reports_success() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("sshftp-tui-save-cmd-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let path = dir.join("connections");
+        let entry = crate::event::SavedConnection {
+            alias: "prod".to_string(),
+            host: "10.0.0.5".to_string(),
+            port: 2222,
+            user: "deploy".to_string(),
+            identity_file: Some("~/.ssh/prod".to_string()),
+        };
+
+        let (tx_cmd, rx_cmd) = mpsc::channel(8);
+        let (tx_evt, mut rx_evt) = mpsc::channel(8);
+        let task = tokio::spawn(run(rx_cmd, tx_evt));
+
+        tx_cmd
+            .send(Cmd::SaveConnection {
+                path: path.clone(),
+                entry: entry.clone(),
+            })
+            .await
+            .expect("the network task is listening");
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), rx_evt.recv())
+            .await
+            .expect("the save reports back")
+            .expect("the event channel stays open");
+        match evt {
+            Evt::ConnectionSaved(saved) => assert_eq!(saved, entry),
+            _ => panic!("expected Evt::ConnectionSaved"),
+        }
+
+        let config = crate::sshconfig::SshConfig::load_at(&path);
+        let resolved = config.lookup("prod").expect("the block was written");
+        assert_eq!(resolved.user.as_deref(), Some("deploy"));
+        assert_eq!(resolved.port, Some(2222));
+
+        drop(tx_cmd);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

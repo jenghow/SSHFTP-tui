@@ -10,6 +10,7 @@ pub mod form;
 pub mod hostkey;
 pub mod keys;
 pub mod network;
+pub mod saved;
 pub mod sftp;
 pub mod sshconfig;
 pub mod ui;

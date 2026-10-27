@@ -1,9 +1,12 @@
 # AGENTS.md
 
 Cross-platform TUI SSH + SFTP client: pure Rust (`russh`, `ratatui`, `vt100`),
-no `libssh2`, no C toolchain. `README.md` covers building, running, logging in
-(password or private key), features and keybindings; this file is the working
-context for changing the code.
+no `libssh2`, no C library. The build still needs the platform's linker and
+`ar` (MSVC on Windows, `build-essential` or `clang` + `binutils` on Linux),
+because `rustc` cannot link without them and `ring` compiles a little C.
+`README.md` covers building, running, logging in (password or private key),
+features and keybindings; this file is the working context for changing the
+code.
 
 ## Commands
 
@@ -23,8 +26,16 @@ cmd /c "cargo test 2>&1" | Select-Object -Last 40; "EXIT=$LASTEXITCODE"
 | Lint gate (currently clean) | `cargo clippy --all-targets -- -D warnings` |
 | Format | `cargo fmt` |
 | End-to-end (ignored by default) | `cargo test --test sshd_e2e -- --ignored --nocapture` |
+| Release (Linux/macOS) | `scripts/release.sh` |
+| Release (Windows) | `powershell -ExecutionPolicy Bypass -File scripts/release.ps1` |
+| Install (Linux, /opt + menu) | `scripts/install.sh` |
 
 Order: `cargo fmt` → `cargo clippy --all-targets -- -D warnings` → `cargo test`.
+
+On Linux the same cargo commands work; the only extra package is a C toolchain
+(`build-essential`, or `clang` + `binutils`), because `rustc` invokes `cc` to
+link and `ring`'s build script needs `ar`. A missing linker shows up as
+``linker `cc` not found``, so install it before blaming the code.
 
 Not a git repository: no commits, branches or history. Don't reach for `git`.
 
@@ -63,13 +74,29 @@ the e2e test uses it once, before any thread reads the variable.
 * `app.rs` holds all state and key routing; `ui.rs` is pure rendering.
 * **`~/.ssh/config` is parsed once, before the UI loop.** `sshconfig.rs` builds
   an in-memory `SshConfig`; `main::run` loads it and passes it to
-  `App::set_ssh_config`, so the UI task never reads the file (and a network
-  `$HOME` cannot stall a frame). `App::apply_ssh_config` fills only fields still
+  `App::set_configs`, so the UI task never reads the file (and a network
+  `$HOME` cannot stall a frame). `App::apply_config` fills only fields still
   at their defaults (empty username, port `22`, `DEFAULT_KEY_PATH`), always
   replaces `Host` with the resolved `HostName` — so the form shows what will be
   dialled and `known_hosts` uses the hostname — and refuses
   `ProxyJump`/`ProxyCommand` with an error instead of dialling directly. The
   note under the fields names the file that was actually read.
+* **Saved connections are app-owned and secret-free.** `saved.rs` stores
+  `~/.config/sshftp-tui/connections` (`%APPDATA%` / Application Support on
+  Windows/macOS, override `SSHFTP_TUI_CONNECTIONS`) in OpenSSH syntax.
+  `main::run` loads it into a second `SshConfig`; `apply_config` checks it
+  *before* `~/.ssh/config`, so an explicit save wins over defaults, and the
+  source note names the saved file. The UI only reads memory:
+  `Cmd::SaveConnection` runs `saved::append_at` in a spawned `spawn_blocking`
+  and answers `Evt::ConnectionSaved` / `Evt::ConnectionSaveFailed`.
+  `event::SavedConnection` has **no password or passphrase field**; the writer
+  is append-only, creates the file 0600 (directory 0700) and refuses an exact
+  alias literal (wildcards like `Host *` do not count, so they never block a
+  save). Login arms `App::save_offer` only when `form.config` is `None` (the
+  host is otherwise already described); F2 is intercepted only while that offer
+  is `Some` and otherwise reaches the remote. `Esc` declines and clears it,
+  `Evt::ConnectionSaved` clears it, and a failed write keeps it for a retry.
+  `Evt::Connected`/`ConnectFailed`/`PtyClosed` also clear the pending profile.
 * **Remote paths are POSIX strings** — `event::{remote_join, remote_parent,
   remote_file_name}`. `PathBuf` is for local paths only, so a Windows client
   can never send `C:\…` to a server.
@@ -97,7 +124,8 @@ the e2e test uses it once, before any thread reads the variable.
   (floors 20×5); `ui::draw_terminal` passes the tab's inner area to the same
   `fit_pty`. Change one and the other must follow.
 * Keys: `Ctrl+T` is intercepted globally; `Ctrl+C` and everything else go to the
-  remote shell. Only `F10` (and `Esc` on the connect form) quit. `Shift+PgUp`/
+  remote shell. `F10` quits and is checked *before* the modal dispatch, so a
+  dialog can never trap the user; `Esc` quits on the connect form. `Shift+PgUp`/
   `PgDn`/`Home`/`End` are the other local exception — see the scrollback bullet.
   On the SFTP tab `F3`–`F9` are local: `F9` opens the chdir dialog, which is the
   only way to jump to a path that is not a child of the current listing. It
@@ -143,10 +171,17 @@ the e2e test uses it once, before any thread reads the variable.
 
 ## Tests
 
+* `cargo test` must stay green on Linux as well as Windows. The path tests have
+  `cfg(windows)` and `cfg(not(windows))` halves, and only the Windows one runs
+  on the original dev box, so a wrong expectation there is easy to miss — run
+  the suite on both before touching `event::local_*`.
 * Unit tests cover key encoding, POSIX path helpers, size formatting,
   form/`TextField` (including bracketed IPv6), `sshconfig` parsing (patterns and
   negation, first-value-wins, `Include`, tokens, proxy detection; fixtures are
-  `SshConfig::parse`/`load_at`, never the real file), host-key policy using two
+  `SshConfig::parse`/`load_at`, never the real file), saved-connection rendering,
+  append/duplicate handling, alias validation and the no-secrets invariant
+  (`saved::append_at` with scratch paths; never set the process-global env var),
+  host-key policy using two
   embedded ed25519 keys, RSA private-key loading (an EC2-style PKCS#1 PEM in
   `network::tests`, which is the guard that `russh`'s `rsa` feature is still
   enabled — it fails with `UnsupportedKeyType` if it is dropped), and the render
@@ -163,7 +198,11 @@ the e2e test uses it once, before any thread reads the variable.
   the previous SFTP state, and a close with no live session must change nothing.
   It also covers the config prefill: leaving the Host field fills only untouched
   values, a typed user/port wins, and a `ProxyJump` alias must put an error in
-  the form without queueing a `Cmd::Connect`.
+  the form without queueing a `Cmd::Connect`. The save flow is here too: a
+  successful key/password login captures a `SavedConnection` with no secret,
+  `form.config` suppresses the offer, F2 is forwarded when no offer exists,
+  Esc declines, a duplicate alias keeps the dialog open, and
+  `ConnectionSaved`/`ConnectionSaveFailed` clear or keep the retry hint.
 * `tests/sshd_e2e.rs` is `#[ignore]`d and needs a server. Env:
   `SSHFTP_TUI_TEST_HOST` / `_PORT` / `_USER` / `_PASSWORD` (defaults
   `127.0.0.1:2222`, `tester`/`testpass`) and `_READONLY`.

@@ -12,11 +12,12 @@ use ratatui::widgets::TableState;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::event::{
-    Cmd, Endpoint, Evt, FsEntry, LogLevel, PaneKind, local_join, local_normalize, local_parent,
-    remote_join, remote_normalize, remote_parent,
+    Cmd, Endpoint, Evt, FsEntry, LogLevel, PaneKind, SavedConnection, local_join, local_normalize,
+    local_parent, remote_join, remote_normalize, remote_parent,
 };
-use crate::form::{ConfigFill, ConnectForm, DEFAULT_KEY_PATH, Field, TextField};
+use crate::form::{AuthKind, ConfigFill, ConnectForm, DEFAULT_KEY_PATH, Field, TextField};
 use crate::keys;
+use crate::saved;
 use crate::sshconfig::SshConfig;
 
 /// Terminal history the parser is built with. It is a *capacity*: how much of
@@ -429,6 +430,10 @@ pub enum InputAction {
         pane: PaneKind,
         base: String,
     },
+    /// Writes the non-secret profile under the alias typed in the field.
+    SaveConnection {
+        entry: SavedConnection,
+    },
 }
 
 pub struct ConfirmModal {
@@ -508,6 +513,19 @@ pub struct App {
     pub blink_on: bool,
     /// Parsed once at startup (`main::run`); lookups are pure.
     ssh_config: SshConfig,
+    /// The app-owned saved-connections file, also parsed at startup. It is
+    /// checked before `ssh_config`, so an entry the user saved explicitly wins
+    /// over a matching default in `~/.ssh/config`.
+    saved: SshConfig,
+    /// Where `Cmd::SaveConnection` writes; resolved at startup, never on a
+    /// keypress.
+    saved_path: PathBuf,
+    /// The credentials-free profile of the connection being dialled. Promoted
+    /// to `save_offer` only after `Evt::Connected`.
+    pending_save: Option<SavedConnection>,
+    /// `Some` while the footer offers `F2`; F2 opens the alias dialog only in
+    /// this state, so it still reaches the remote shell otherwise.
+    pub(crate) save_offer: Option<SavedConnection>,
     tx: mpsc::Sender<Cmd>,
 }
 
@@ -542,6 +560,10 @@ impl App {
             next_transfer_id: 1,
             blink_on: true,
             ssh_config: SshConfig::default(),
+            saved: SshConfig::default(),
+            saved_path: saved::path(),
+            pending_save: None,
+            save_offer: None,
             tx,
         };
         app.log(
@@ -600,16 +622,18 @@ impl App {
         }
         // Keep the caret solid while the user is typing.
         self.blink_on = true;
+        // Quit is global: a dialog must never trap the user. The host-key
+        // answer is dropped with the app, which aborts that handshake.
+        if key.code == KeyCode::F(10) {
+            self.should_quit = true;
+            return;
+        }
         if self.modal.is_some() {
             self.on_modal_key(key).await;
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
             self.cycle_tab();
-            return;
-        }
-        if key.code == KeyCode::F(10) {
-            self.should_quit = true;
             return;
         }
         match self.screen {
@@ -700,32 +724,57 @@ impl App {
         self.remote = Pane::new("/");
         self.transfer = None;
         self.host_label = "sshftp-tui".to_string();
+        // The offer belonged to the session that just died.
+        self.pending_save = None;
+        self.save_offer = None;
     }
 
-    /// Hands the parsed `~/.ssh/config` to the app: `main::run` calls this once,
-    /// before the first frame, and the tests call it with a parsed fixture.
-    pub fn set_ssh_config(&mut self, config: SshConfig) {
-        self.ssh_config = config;
+    /// Hands both parsed configs to the app: `main::run` calls this once,
+    /// before the first frame, and the tests call it with parsed fixtures.
+    /// `saved` is the app-owned file and is checked first.
+    pub fn set_configs(&mut self, ssh_config: SshConfig, saved: SshConfig, saved_path: PathBuf) {
+        self.ssh_config = ssh_config;
+        self.saved = saved;
+        self.saved_path = saved_path;
         // A target on the command line may already name an alias.
-        if let Err(error) = self.apply_ssh_config() {
+        if let Err(error) = self.apply_config() {
             self.form.error = Some(error);
         }
     }
 
-    /// Fills the form from the parsed config. Only fields still holding their
-    /// defaults are replaced, and the Host field becomes the resolved
-    /// `HostName`, so what the form shows is exactly what will be dialled.
+    /// Kept for the tests and callers that only have `~/.ssh/config`.
+    pub fn set_ssh_config(&mut self, config: SshConfig) {
+        self.ssh_config = config;
+        if let Err(error) = self.apply_config() {
+            self.form.error = Some(error);
+        }
+    }
+
+    /// Fills the form from the saved connections first, then `~/.ssh/config`.
+    /// Only fields still holding their defaults are replaced, and the Host
+    /// field becomes the resolved `HostName`, so what the form shows is exactly
+    /// what will be dialled.
     ///
     /// `ProxyJump`/`ProxyCommand` are refused rather than ignored: this client
     /// cannot reach a host through a bastion, and pretending otherwise would
     /// hide that the connection is a different one.
-    fn apply_ssh_config(&mut self) -> Result<(), String> {
+    fn apply_config(&mut self) -> Result<(), String> {
         let typed = self.form.host.trimmed().to_string();
         if typed.is_empty() {
             return Ok(());
         }
 
-        let Some(resolved) = self.ssh_config.lookup(&typed) else {
+        let resolved = self
+            .saved
+            .lookup(&typed)
+            .map(|resolved| (resolved, self.saved.label().to_string()))
+            .or_else(|| {
+                self.ssh_config
+                    .lookup(&typed)
+                    .map(|resolved| (resolved, self.ssh_config.label().to_string()))
+            });
+
+        let Some((resolved, source)) = resolved else {
             // Keep the note when the Host field already holds the hostname we
             // resolved; clear it when the operator typed something else.
             if !self
@@ -742,7 +791,7 @@ impl App {
         if let Some(proxy) = &resolved.proxy {
             self.form.config = None;
             return Err(format!(
-                "{proxy} is set for {typed} in ~/.ssh/config; jump hosts are not supported, connect directly or use ssh"
+                "{proxy} is set for {typed} in {source}; jump hosts are not supported, connect directly or use ssh"
             ));
         }
 
@@ -766,7 +815,7 @@ impl App {
         }
 
         self.form.config = Some(ConfigFill {
-            source: self.ssh_config.label().to_string(),
+            source,
             endpoint: self.form.endpoint(),
             alias: resolved.alias,
             hostname: resolved.hostname,
@@ -780,7 +829,7 @@ impl App {
         if self.form.focus != Field::Host {
             return;
         }
-        if let Err(error) = self.apply_ssh_config() {
+        if let Err(error) = self.apply_config() {
             self.form.error = Some(error);
         }
     }
@@ -788,13 +837,32 @@ impl App {
     async fn submit_connect(&mut self) {
         // A `Host` alias may be the only thing in the form; resolve it before
         // validation so the config can supply the username and port.
-        if let Err(error) = self.apply_ssh_config() {
+        self.pending_save = None;
+        if let Err(error) = self.apply_config() {
             self.form.error = Some(error);
             self.form.connecting = false;
             return;
         }
         match self.form.build_params(self.pty_cols, self.pty_rows) {
             Ok(params) => {
+                // Capture the non-secret profile now, while the form still
+                // holds what was submitted. A host that already resolves from
+                // either config is treated as saved and gets no offer.
+                let identity_file = match self.form.auth {
+                    AuthKind::KeyFile => Some(self.form.key_path.trimmed().to_string()),
+                    AuthKind::Password => None,
+                };
+                self.pending_save = if self.form.config.is_none() {
+                    Some(SavedConnection {
+                        alias: saved::default_alias(&params.username, &params.host),
+                        host: params.host.clone(),
+                        port: params.port,
+                        user: params.username.clone(),
+                        identity_file,
+                    })
+                } else {
+                    None
+                };
                 // A fresh session starts on a blank grid: neither the previous
                 // session's screen nor its history may show through, and the
                 // view must not open scrolled back.
@@ -819,6 +887,12 @@ impl App {
     }
 
     async fn on_terminal_key(&mut self, key: KeyEvent) {
+        // The save offer is the only time F2 is local; otherwise it reaches the
+        // remote shell like every other function key.
+        if key.code == KeyCode::F(2) && self.save_offer.is_some() {
+            self.open_save_modal();
+            return;
+        }
         // Shift+PgUp/PgDn walk the parser's history and Shift+Home/End jump to
         // its ends. They are intercepted here so the unmodified keys can keep
         // reaching the remote shell, where `less`, `vim` and `tmux` want them.
@@ -1122,6 +1196,21 @@ impl App {
         }));
     }
 
+    /// The F2 dialog after a successful login. The entry is cloned so the
+    /// modal owns it; the dialog only edits the alias.
+    fn open_save_modal(&mut self) {
+        let Some(entry) = self.save_offer.clone() else {
+            return;
+        };
+        self.modal = Some(Modal::Input(InputModal {
+            title: "Save connection".to_string(),
+            label: "Alias in saved connections (no password is saved):".to_string(),
+            field: TextField::new(&entry.alias),
+            error: None,
+            action: InputAction::SaveConnection { entry },
+        }));
+    }
+
     /// Resolve a typed directory against the pane's cwd. Absolute input wins;
     /// otherwise the two are joined and folded, so `..` and `sub/./x` work.
     fn resolve_dir(pane: PaneKind, base: &str, value: &str) -> String {
@@ -1199,53 +1288,87 @@ impl App {
                     // Only a valid Enter and Esc close the dialog. Every other
                     // key edits the field and the modal is put back below, or
                     // the dialog would vanish on the first keystroke.
-                    KeyCode::Esc => return,
+                    KeyCode::Esc => {
+                        // Esc in the save dialog means "not now": drop the
+                        // offer so the footer stops suggesting F2.
+                        if matches!(modal.action, InputAction::SaveConnection { .. }) {
+                            self.save_offer = None;
+                        }
+                        return;
+                    }
                     KeyCode::Enter => {
-                        let value = modal.field.value.trim().to_string();
-                        let is_chdir = matches!(modal.action, InputAction::ChangeDir { .. });
-                        if value.is_empty() {
-                            modal.error = Some(if is_chdir {
-                                "Path cannot be empty".to_string()
+                        if let InputAction::SaveConnection { entry } = &modal.action {
+                            let alias = modal.field.value.trim().to_string();
+                            if !saved::valid_alias(&alias) {
+                                modal.error =
+                                    Some("Use letters, digits, '.', '_' and '-' only".to_string());
+                            } else if self.saved.defines_alias(&alias)
+                                || self.ssh_config.defines_alias(&alias)
+                            {
+                                modal.error = Some(format!("Alias {alias} is already defined"));
                             } else {
-                                "Name cannot be empty".to_string()
-                            });
-                        } else if let InputAction::ChangeDir { pane, base } = &modal.action {
-                            let target = Self::resolve_dir(*pane, base, &value);
-                            let cmd = match pane {
-                                PaneKind::Local => Cmd::LocalList { path: target },
-                                PaneKind::Remote => Cmd::SftpList { path: target },
-                            };
-                            self.send(cmd).await;
-                            return;
-                        } else if value.contains('/')
-                            || value.contains('\\')
-                            || value == "."
-                            || value == ".."
-                        {
-                            modal.error = Some(
-                                "Name cannot contain path separators or be . or ..".to_string(),
-                            );
-                        } else {
-                            match modal.action {
-                                InputAction::Rename { pane, from } => {
-                                    self.send(Cmd::Rename {
-                                        pane,
-                                        from,
-                                        to: value,
-                                    })
-                                    .await;
-                                }
-                                InputAction::Mkdir { pane, parent } => {
-                                    self.send(Cmd::Mkdir {
-                                        pane,
-                                        parent,
-                                        name: value,
-                                    })
-                                    .await;
-                                }
-                                InputAction::ChangeDir { .. } => unreachable!(),
+                                let entry = SavedConnection {
+                                    alias,
+                                    ..entry.clone()
+                                };
+                                // Keep the submitted entry so a failed write
+                                // can be retried with F2 and the same alias.
+                                self.save_offer = Some(entry.clone());
+                                self.send(Cmd::SaveConnection {
+                                    path: self.saved_path.clone(),
+                                    entry,
+                                })
+                                .await;
+                                return;
                             }
-                            return;
+                        } else {
+                            let value = modal.field.value.trim().to_string();
+                            let is_chdir = matches!(modal.action, InputAction::ChangeDir { .. });
+                            if value.is_empty() {
+                                modal.error = Some(if is_chdir {
+                                    "Path cannot be empty".to_string()
+                                } else {
+                                    "Name cannot be empty".to_string()
+                                });
+                            } else if let InputAction::ChangeDir { pane, base } = &modal.action {
+                                let target = Self::resolve_dir(*pane, base, &value);
+                                let cmd = match pane {
+                                    PaneKind::Local => Cmd::LocalList { path: target },
+                                    PaneKind::Remote => Cmd::SftpList { path: target },
+                                };
+                                self.send(cmd).await;
+                                return;
+                            } else if value.contains('/')
+                                || value.contains('\\')
+                                || value == "."
+                                || value == ".."
+                            {
+                                modal.error = Some(
+                                    "Name cannot contain path separators or be . or ..".to_string(),
+                                );
+                            } else {
+                                match modal.action {
+                                    InputAction::Rename { pane, from } => {
+                                        self.send(Cmd::Rename {
+                                            pane,
+                                            from,
+                                            to: value,
+                                        })
+                                        .await;
+                                    }
+                                    InputAction::Mkdir { pane, parent } => {
+                                        self.send(Cmd::Mkdir {
+                                            pane,
+                                            parent,
+                                            name: value,
+                                        })
+                                        .await;
+                                    }
+                                    InputAction::ChangeDir { .. } => unreachable!(),
+                                    InputAction::SaveConnection { .. } => unreachable!(),
+                                }
+                                return;
+                            }
                         }
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1297,7 +1420,16 @@ impl App {
                 self.sftp = SftpState::NotInitialized;
                 self.remote = Pane::new("/");
                 self.transfer = None;
-                self.set_status(format!("Connected to {host}:{port}"));
+                // Only a connection that was not already described by a config
+                // has a pending profile; those hosts need no save offer.
+                self.save_offer = self.pending_save.take();
+                if self.save_offer.is_some() {
+                    self.set_status(format!(
+                        "Connected to {host}:{port} — [F2] saves this connection"
+                    ));
+                } else {
+                    self.set_status(format!("Connected to {host}:{port}"));
+                }
                 self.log(
                     LogLevel::Info,
                     format!("connected to {user}@{host}:{port} — PTY xterm-256color"),
@@ -1309,8 +1441,38 @@ impl App {
                 self.form.connecting = false;
                 self.form.error = Some(message.clone());
                 self.connected = false;
+                self.pending_save = None;
+                self.save_offer = None;
                 self.log(LogLevel::Error, format!("connection failed: {message}"));
                 self.set_status("Connection failed");
+            }
+            Evt::ConnectionSaved(entry) => {
+                if let Err(error) = saved::add_to_config(&mut self.saved, &entry) {
+                    self.log(
+                        LogLevel::Warn,
+                        format!("saved connection is not available in memory: {error:#}"),
+                    );
+                }
+                self.save_offer = None;
+                let label = self.saved.label().to_string();
+                self.set_status(format!("Saved as {} in {label}", entry.alias));
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "saved connection {} ({}) to {label}",
+                        entry.alias,
+                        entry.endpoint()
+                    ),
+                );
+            }
+            Evt::ConnectionSaveFailed(message) => {
+                // `save_offer` still holds the submitted entry, so F2 retries
+                // with the alias the user typed.
+                self.log(
+                    LogLevel::Error,
+                    format!("could not save connection: {message}"),
+                );
+                self.set_status(format!("Could not save connection: {message}"));
             }
             Evt::HostKeyPrompt {
                 host,
@@ -1479,6 +1641,16 @@ mod tests {
             Modal::Input(modal) => &modal.field,
             _ => panic!("expected the input modal"),
         }
+    }
+
+    #[test]
+    fn f10_quits_even_when_a_dialog_is_open() {
+        let (mut app, _rx) = app();
+        app.open_mkdir_modal();
+
+        futures::executor::block_on(app.on_key(press(KeyCode::F(10))));
+
+        assert!(app.should_quit, "F10 is global and must not be trapped");
     }
 
     #[test]
@@ -2254,5 +2426,230 @@ mod tests {
         assert_eq!(app.sftp, SftpState::NotInitialized);
         assert!(app.remote.entries.is_empty());
         assert!(app.transfer.is_none());
+    }
+
+    fn saved_entry() -> SavedConnection {
+        SavedConnection {
+            alias: "example.com".to_string(),
+            host: "example.com".to_string(),
+            port: 2222,
+            user: "alice".to_string(),
+            identity_file: Some("~/.ssh/prod_ed25519".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_password_login_offers_a_save_without_the_password() {
+        let (mut app, mut rx) = app();
+        app.form.host = TextField::new("example.com");
+        app.form.username = TextField::new("alice");
+        app.form.password = TextField::new("hunter2");
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Connect(_))));
+
+        let pending = app.pending_save.as_ref().expect("a profile was captured");
+        assert_eq!(pending.host, "example.com");
+        assert_eq!(pending.user, "alice");
+        assert_eq!(pending.port, 22);
+        assert_eq!(pending.identity_file, None);
+        assert!(
+            !format!("{pending:?}").contains("hunter2"),
+            "the password must never enter the saved profile"
+        );
+
+        futures::executor::block_on(app.on_event(Evt::Connected {
+            host: "example.com".to_string(),
+            port: 22,
+            user: "alice".to_string(),
+        }));
+        drain(&mut rx);
+        assert!(app.save_offer.is_some(), "successful login arms the offer");
+        assert!(app.status.contains("[F2]"), "{}", app.status);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::F(2))));
+        assert_eq!(input_field(&app).value, "example.com");
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+        match rx.try_recv() {
+            Ok(Cmd::SaveConnection { path, entry }) => {
+                assert_eq!(path, app.saved_path);
+                assert_eq!(entry.alias, "example.com");
+                assert_eq!(entry.user, "alice");
+                assert_eq!(entry.port, 22);
+                assert_eq!(entry.identity_file, None);
+                assert!(!format!("{entry:?}").contains("hunter2"));
+            }
+            Ok(_) => panic!("expected Cmd::SaveConnection"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn a_key_login_captures_the_raw_key_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let key = std::env::temp_dir().join(format!("sshftp-tui-key-{nanos}"));
+        std::fs::write(&key, b"not a real key").expect("write the scratch key");
+        let raw = key.display().to_string();
+
+        let (mut app, mut rx) = app();
+        app.form.host = TextField::new("10.0.0.5");
+        app.form.username = TextField::new("deploy");
+        app.form.auth = AuthKind::KeyFile;
+        app.form.key_path = TextField::new(&raw);
+        app.form.passphrase = TextField::new("do-not-store-me");
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Connect(_))));
+
+        let pending = app.pending_save.as_ref().expect("a profile was captured");
+        assert_eq!(pending.identity_file.as_deref(), Some(raw.as_str()));
+        assert!(!format!("{pending:?}").contains("do-not-store-me"));
+
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn a_host_already_described_by_config_gets_no_offer() {
+        let (mut app, mut rx) = app();
+        app.set_ssh_config(SshConfig::parse(
+            "Host example.com\n    User deploy\n    Port 2222\n",
+        ));
+        app.form.host = TextField::new("example.com");
+        app.form.username = TextField::new("deploy");
+        app.form.password = TextField::new("secret");
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Connect(_))));
+        assert!(app.pending_save.is_none());
+
+        futures::executor::block_on(app.on_event(Evt::Connected {
+            host: "example.com".to_string(),
+            port: 2222,
+            user: "deploy".to_string(),
+        }));
+        drain(&mut rx);
+
+        assert!(
+            app.save_offer.is_none(),
+            "a configured host is already saved"
+        );
+    }
+
+    #[test]
+    fn f2_without_an_offer_still_reaches_the_remote() {
+        let (mut app, mut rx) = app();
+        app.screen = Screen::Main;
+        app.tab = Tab::Terminal;
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::F(2))));
+
+        match rx.try_recv() {
+            Ok(Cmd::PtyInput(bytes)) => assert_eq!(bytes, b"\x1bOQ"),
+            Ok(_) => panic!("expected the F2 byte sequence"),
+            Err(err) => panic!("nothing was sent: {err}"),
+        }
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn esc_in_the_save_dialog_declines_and_clears_the_offer() {
+        let (mut app, mut rx) = app();
+        app.save_offer = Some(saved_entry());
+        app.open_save_modal();
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Esc)));
+
+        assert!(app.modal.is_none());
+        assert!(app.save_offer.is_none(), "a decline must stop the F2 hint");
+        assert!(rx.try_recv().is_err(), "nothing is written");
+    }
+
+    #[test]
+    fn a_duplicate_alias_keeps_the_save_dialog_open() {
+        let (mut app, mut rx) = app();
+        app.saved = SshConfig::parse("Host example.com\n    User other\n");
+        app.save_offer = Some(saved_entry());
+        app.open_save_modal();
+        drain(&mut rx);
+
+        futures::executor::block_on(app.on_key(press(KeyCode::Enter)));
+
+        match app.modal.as_ref().expect("the dialog stays open") {
+            Modal::Input(modal) => {
+                let error = modal.error.as_deref().unwrap_or_default();
+                assert!(error.contains("already defined"), "{error}");
+            }
+            _ => panic!("expected the input modal"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing is written");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_offer_for_a_retry() {
+        let (mut app, mut rx) = app();
+        app.save_offer = Some(saved_entry());
+
+        futures::executor::block_on(
+            app.on_event(Evt::ConnectionSaveFailed("permission denied".to_string())),
+        );
+        drain(&mut rx);
+
+        assert!(app.save_offer.is_some(), "F2 can retry");
+        assert!(app.status.contains("Could not save"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_saved_connection_prefills_the_form_in_the_same_session() {
+        let (mut app, mut rx) = app();
+        let mut saved = SshConfig::default();
+        saved.set_label("saved connections");
+        app.saved = saved;
+        let path = app.saved_path.clone();
+
+        futures::executor::block_on(app.on_event(Evt::ConnectionSaved(saved_entry())));
+        drain(&mut rx);
+        assert!(
+            app.save_offer.is_none(),
+            "a successful save clears the hint"
+        );
+        assert_eq!(app.saved.label(), "saved connections");
+        assert!(app.saved.lookup("example.com").is_some());
+        assert!(app.status.contains("example.com"), "{}", app.status);
+
+        // End the session and type the alias on the fresh login form.
+        app.connected = true;
+        futures::executor::block_on(app.on_event(Evt::PtyClosed(Some(0))));
+        app.form.host = TextField::new("example.com");
+        futures::executor::block_on(app.on_key(press(KeyCode::Tab)));
+
+        assert_eq!(app.form.host.value, "example.com");
+        assert_eq!(app.form.username.value, "alice");
+        assert_eq!(app.form.port.value, "2222");
+        assert_eq!(app.form.key_path.value, "~/.ssh/prod_ed25519");
+        let fill = app.form.config.as_ref().expect("the source note is set");
+        assert_eq!(fill.source, "saved connections");
+        assert_eq!(fill.alias, "example.com");
+        assert_eq!(app.saved_path, path);
+    }
+
+    #[test]
+    fn a_failed_connect_forgets_the_save_profile() {
+        let (mut app, mut rx) = app();
+        app.pending_save = Some(saved_entry());
+        app.save_offer = Some(saved_entry());
+
+        futures::executor::block_on(app.on_event(Evt::ConnectFailed("nope".to_string())));
+        drain(&mut rx);
+
+        assert!(app.pending_save.is_none());
+        assert!(app.save_offer.is_none());
     }
 }

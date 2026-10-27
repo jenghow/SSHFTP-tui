@@ -10,7 +10,7 @@ pub enum AuthKind {
     KeyFile,
 }
 
-/// The key path the form opens with; `apply_ssh_config` treats this value as
+/// The key path the form opens with; `apply_config` treats this value as
 /// "not chosen yet" and may replace it with the block's `IdentityFile`.
 pub const DEFAULT_KEY_PATH: &str = "~/.ssh/id_ed25519";
 

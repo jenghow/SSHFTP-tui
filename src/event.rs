@@ -45,6 +45,27 @@ pub struct ConnectParams {
     pub rows: u16,
 }
 
+/// The non-secret part of a successful connection, ready to be written as a
+/// `Host` block. There is deliberately no password, passphrase or
+/// [`AuthMethod`] field: whatever reaches the disk cannot contain a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedConnection {
+    pub alias: String,
+    /// The resolved hostname that was dialled.
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// The key path exactly as typed (`~/...` is preserved), if the login used
+    /// a private key. `None` for password logins.
+    pub identity_file: Option<String>,
+}
+
+impl SavedConnection {
+    pub fn endpoint(&self) -> String {
+        format!("{}@{}:{}", self.user, self.host, self.port)
+    }
+}
+
 /// Commands sent from the UI task to the network task.
 pub enum Cmd {
     Connect(ConnectParams),
@@ -80,6 +101,13 @@ pub enum Cmd {
         path: String,
         is_dir: bool,
     },
+    /// Append the entry to the user's saved-connections file. This is local
+    /// disk I/O, so it runs on the network task even though no server is
+    /// involved.
+    SaveConnection {
+        path: PathBuf,
+        entry: SavedConnection,
+    },
     Disconnect,
 }
 
@@ -91,6 +119,9 @@ pub enum Evt {
         user: String,
     },
     ConnectFailed(String),
+    /// The non-secret connection details were written to the saved file.
+    ConnectionSaved(SavedConnection),
+    ConnectionSaveFailed(String),
     /// The remote key is not in known_hosts. `answer` is used to reply to the
     /// blocked SSH handshake.
     HostKeyPrompt {
@@ -360,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn local_normalize_keeps_the_windows_prefix_and_root() {
+    fn local_normalize_keeps_the_platform_prefix_and_root() {
         #[cfg(windows)]
         {
             assert_eq!(local_normalize(r"C:\Users\me\..\other"), r"C:\Users\other");
@@ -369,7 +400,9 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
-            assert_eq!(local_normalize("/home/me/../other"), "/other");
+            // `..` only removes `me`; the second case removes `me` and `home`.
+            assert_eq!(local_normalize("/home/me/../other"), "/home/other");
+            assert_eq!(local_normalize("/home/me/../../other"), "/other");
             assert_eq!(local_normalize("/"), "/");
         }
     }

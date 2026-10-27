@@ -99,6 +99,37 @@ impl SshConfig {
         &self.label
     }
 
+    /// Used for the app-owned saved-connections file, whose label is not the
+    /// `~/.ssh/config` default detected by [`label_for`].
+    pub fn set_label(&mut self, label: impl Into<String>) {
+        self.label = label.into();
+    }
+
+    /// Whether a block declares `alias` literally. Wildcards do not count: a
+    /// normal `Host *` block must not make every save look like a duplicate.
+    pub fn defines_alias(&self, alias: &str) -> bool {
+        self.blocks.iter().any(|block| {
+            let mut positive = false;
+            for pattern in &block.patterns {
+                if let Some(negated) = pattern.strip_prefix('!') {
+                    if glob_match(negated, alias) {
+                        return false;
+                    }
+                } else if pattern.eq_ignore_ascii_case(alias) {
+                    positive = true;
+                }
+            }
+            positive
+        })
+    }
+
+    /// Appends the blocks parsed from `text`. Used after a successful save so
+    /// the alias resolves in this session without re-reading the disk.
+    pub fn add_text(&mut self, text: &str) {
+        let parsed = Self::parse(text);
+        self.blocks.extend(parsed.blocks);
+    }
+
     /// Parses config text directly; `Include` resolves relative to the current
     /// directory. Used by the tests.
     pub fn parse(text: &str) -> Self {
@@ -671,6 +702,44 @@ Host prod
         assert_eq!(config.lookup("extra").unwrap().port, Some(2222));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn defines_alias_ignores_wildcards_and_negation() {
+        let config = SshConfig::parse(
+            "\
+Host *
+    User fallback
+Host prod
+    Port 2222
+Host blocked !blocked
+    User nobody
+",
+        );
+
+        assert!(config.defines_alias("prod"));
+        assert!(config.defines_alias("PROD"), "aliases are case-insensitive");
+        assert!(
+            !config.defines_alias("other"),
+            "Host * must not look like a literal alias"
+        );
+        assert!(
+            !config.defines_alias("blocked"),
+            "a negated pattern cancels the block"
+        );
+    }
+
+    #[test]
+    fn add_text_makes_a_rendered_block_resolve_in_memory() {
+        let mut config = SshConfig::parse("");
+        config.add_text(
+            "Host saved\n    HostName 10.1.2.3\n    User deploy\n    IdentityFile ~/.ssh/saved\n",
+        );
+
+        let resolved = config.lookup("saved").expect("the added block resolves");
+        assert_eq!(resolved.hostname, "10.1.2.3");
+        assert_eq!(resolved.user.as_deref(), Some("deploy"));
+        assert_eq!(resolved.identity_file.as_deref(), Some("~/.ssh/saved"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
-use crate::app::{App, Focus, Modal, Pane, Screen, SftpState, SortKey, Tab};
+use crate::app::{App, Focus, InputAction, Modal, Pane, Screen, SftpState, SortKey, Tab};
 use crate::event::{LogLevel, PaneKind};
 use crate::form::{AuthKind, Field};
 
@@ -377,7 +377,14 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
-        Tab::Terminal => "[Ctrl+T] Tab Change   [F10] Exit".to_string(),
+        Tab::Terminal => {
+            let base = "[Ctrl+T] Tab Change   [F10] Exit";
+            if app.save_offer.is_some() {
+                format!("[F2] Save connection   {base}")
+            } else {
+                base.to_string()
+            }
+        }
         Tab::Sftp => format!(
             "Focus: {}  F3 Init  Tab Pane  Enter  F4 Refr  F5 Copy  F6 Ren  F7 Mkdir  F8 Del  F9 Chdir  / Find  s Sort",
             app.focus.label()
@@ -566,6 +573,16 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                     Style::new().fg(Color::White),
                 )),
             ];
+            if matches!(input.action, InputAction::SaveConnection { .. }) {
+                lines.push(Line::from(Span::styled(
+                    " Host, user, port and key path only.",
+                    Style::new().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    " No password or passphrase is stored.",
+                    Style::new().fg(Color::DarkGray),
+                )));
+            }
             if let Some(error) = &input.error {
                 lines.push(Line::from(Span::styled(
                     format!(" {error}"),
@@ -652,7 +669,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::app::{App, HostKeyModal, InputAction, InputModal, SftpState};
-    use crate::event::{Cmd, FsEntry, LogLevel};
+    use crate::event::{Cmd, FsEntry, LogLevel, SavedConnection};
     use crate::form::{ConfigFill, TextField};
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend};
@@ -1083,6 +1100,52 @@ mod tests {
         app.focus = Focus::Remote;
         let text = render(&mut app, 120, 30);
         assert!(text.contains("Focus: Right"), "{text}");
+    }
+
+    #[test]
+    fn the_save_offer_adds_the_f2_hint_only_while_pending() {
+        let (mut app, _rx) = app();
+        app.screen = Screen::Main;
+        app.tab = Tab::Terminal;
+        assert!(!render(&mut app, 120, 30).contains("[F2] Save"));
+
+        app.save_offer = Some(SavedConnection {
+            alias: "prod".to_string(),
+            host: "10.0.0.5".to_string(),
+            port: 2222,
+            user: "deploy".to_string(),
+            identity_file: Some("~/.ssh/prod".to_string()),
+        });
+        let text = render(&mut app, 120, 30);
+        assert!(text.contains("[F2] Save connection"), "{text}");
+    }
+
+    #[test]
+    fn the_save_modal_says_no_secret_is_stored() {
+        let (mut app, _rx) = app();
+        app.modal = Some(Modal::Input(InputModal {
+            title: "Save connection".to_string(),
+            label: "Alias in saved connections (no password is saved):".to_string(),
+            field: TextField::new("prod"),
+            error: None,
+            action: InputAction::SaveConnection {
+                entry: SavedConnection {
+                    alias: "prod".to_string(),
+                    host: "10.0.0.5".to_string(),
+                    port: 2222,
+                    user: "deploy".to_string(),
+                    identity_file: Some("~/.ssh/prod".to_string()),
+                },
+            },
+        }));
+
+        let text = render(&mut app, 120, 30);
+        assert!(text.contains("Save connection"), "{text}");
+        assert!(text.contains("prod"), "{text}");
+        assert!(
+            text.contains("No password or passphrase is stored"),
+            "{text}"
+        );
     }
 
     #[test]
